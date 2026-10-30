@@ -1,8 +1,8 @@
 import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
-import { HttpError, lookupAddress, lookupTx, redeem } from './cctp'
-import { corsOrigins, host, injective, network, port, redeemsPerMinute, relayer, requestsPerMinute, sources, trustProxy } from './config'
-import { indexedBlocks, startIndexer } from './indexer'
+import { autoRedeem, balance, fees, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
+import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, TOKEN_MESSENGER, trustProxy } from './config'
+import { indexedBlocks, queuedTxs, startIndexer } from './indexer'
 
 // Fixed-window counter per client IP.
 function rateLimit(max: number, windowMs = 60_000) {
@@ -20,6 +20,24 @@ function rateLimit(max: number, windowMs = 60_000) {
   }
 }
 const limits = { requests: rateLimit(requestsPerMinute), redeems: rateLimit(redeemsPerMinute) }
+
+// What a bridge UI needs. rpc is each chain's public RPC, for wallets that have to add the chain; the RPC_* overrides stay private.
+const chainInfo = {
+  network,
+  autoRedeem: !!relayer,
+  tokenMessenger: TOKEN_MESSENGER,
+  messageTransmitter: MESSAGE_TRANSMITTER,
+  chains: chains.map(({ domain, name, chain, usdc }) => ({
+    domain,
+    name,
+    chainId: chain.id,
+    usdc,
+    rpc: chain.rpcUrls.default.http[0],
+    explorer: chain.blockExplorers?.default.url,
+    nativeCurrency: chain.nativeCurrency,
+  })),
+}
+const domainId = t.Integer({ minimum: 0 })
 
 const app = new Elysia()
   .onRequest(({ request, server, set, status }) => {
@@ -52,18 +70,32 @@ const app = new Elysia()
   .get('/health', async () => ({
     network,
     relayer: relayer?.account.address ?? null,
-    balance: relayer ? await injective.getBalance({ address: relayer.account.address }).then(formatEther, () => null) : null,
+    balance: relayer ? await injective.client.getBalance({ address: relayer.account.address }).then(formatEther, () => null) : null,
+    queued: queuedTxs().length,
     indexedBlocks: indexedBlocks(),
   }))
+  .get('/chains', () => chainInfo)
+  .get('/fees/:from/:to', ({ params }) => fees(params.from, params.to), {
+    params: t.Object({ from: domainId, to: domainId }),
+  })
+  .get('/balance/:domain/:address', ({ params }) => balance(params.domain, params.address), {
+    params: t.Object({ domain: domainId, address: t.String() }),
+  })
   .get('/address/:address', ({ params }) => lookupAddress(params.address))
   .get('/tx/:hash', ({ params, query }) => lookupTx(params.hash, query.domain), {
-    query: t.Object({ domain: t.Optional(t.Integer({ minimum: 0 })) }),
+    query: t.Object({ domain: t.Optional(domainId) }),
   })
-  .post('/redeem', ({ body }) => redeem(body.txHash, body.domain), {
-    body: t.Object({ txHash: t.String(), domain: t.Optional(t.Integer({ minimum: 0 })) }),
-  })
+  .post(
+    '/redeem',
+    async ({ body, status }) => {
+      const result = await redeem(body.txHash, body.domain)
+      return result.queued ? status(202, { transfers: result.transfers }) : { transfers: result.transfers }
+    },
+    { body: t.Object({ txHash: t.String(), domain: t.Optional(domainId) }) },
+  )
   .listen({ port, hostname: host })
 
 startIndexer()
-console.log(`CCTP → Injective redeemer (${network}) on http://localhost:${app.server?.port}`)
-console.log(`Relayer: ${relayer?.account.address ?? 'disabled (set RELAYER_PRIVATE_KEY)'} · indexing ${sources.length} source chains`)
+void autoRedeem()
+console.log(`Injective CCTP bridge API (${network}) on http://localhost:${app.server?.port}`)
+console.log(`Relayer: ${relayer?.account.address ?? 'disabled (set RELAYER_PRIVATE_KEY)'} · indexing ${chains.length} chains`)

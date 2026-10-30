@@ -1,6 +1,7 @@
 import {
   BaseError,
   ContractFunctionRevertedError,
+  erc20Abi,
   formatUnits,
   hexToBigInt,
   hexToNumber,
@@ -15,6 +16,8 @@ import {
   type TransactionReceipt,
 } from 'viem'
 import {
+  chainOf,
+  chains,
   domainName,
   injective,
   INJECTIVE_DOMAIN,
@@ -23,11 +26,10 @@ import {
   minRedeemAmount,
   relayer,
   SOLANA_DOMAIN,
-  sources,
   TOKEN_MESSENGER,
   txUrl,
 } from './config'
-import { domainOf, indexReceipt, markRedeemed, redeemTxOf, saveRedeem, unredeemedTxs } from './indexer'
+import { dequeue, domainOf, enqueue, indexReceipt, markRedeemed, queuedTxs, redeemTxOf, saveRedeem, unredeemedTxs } from './indexer'
 
 export class HttpError extends Error {
   status: number
@@ -40,27 +42,49 @@ export class HttpError extends Error {
 export type Transfer = {
   sourceDomain: number
   sourceChain: string
+  destinationDomain: number
+  destinationChain: string
   txHash: string
   txUrl?: string
   nonce?: Hex
   amount?: string
+  fee?: string
   sender?: string
   recipient?: string
   status: 'pending' | 'ready' | 'redeemed' | 'restricted'
   note?: string
   redeemTx?: string
   redeemTxUrl?: string
+  message?: Hex
+  attestation?: Hex
 }
 
 type Burn = NonNullable<ReturnType<typeof decodeBurn>>
-type Found = { transfer: Transfer; burn?: Burn; message?: Hex; attestation?: Hex }
-type IrisMessage = { message: Hex | null; eventNonce: Hex; attestation: string | null; status: string; cctpVersion: number }
+type Found = { transfer: Transfer; burn?: Burn; message?: Hex; attestation?: Hex; iris?: IrisMessage }
+type IrisMessage = {
+  message: Hex | null
+  eventNonce: Hex
+  attestation: string | null
+  status: string
+  cctpVersion: number
+  forwardState?: string | null
+  forwardTxHash?: string | null
+  destinationMintTxHash?: string | null
+}
 
 const transmitterAbi = parseAbi([
   'function receiveMessage(bytes message, bytes attestation) returns (bool)',
   'function usedNonces(bytes32 nonce) view returns (uint256)',
 ])
 const MessageSent = parseAbiItem('event MessageSent(bytes message)')
+// Hook data that asks Circle's Forwarding Service to mint on the destination chain: https://developers.circle.com/cctp/concepts/forwarding-service
+const FORWARD_HOOK = toHex('cctp-forward')
+// Circle's average wait for a standard attestation, on the sources where it's more than a few seconds:
+// https://developers.circle.com/cctp/required-block-confirmations
+const SLOW_FINALITY: Record<number, string> = {
+  0: '~20 min', 2: '~20 min', 3: '~20 min', 6: '~20 min', 10: '~20 min', 11: '6–32 h', 12: '~20 min',
+  14: '~20 min', 21: '~30 min', 22: '~20 min', 25: '2–4 h', 28: '~20 min', 30: '~30 min', 37: '~20 min',
+}
 const same = (a?: string, b?: string) => !!a && !!b && a.toLowerCase() === b.toLowerCase()
 
 // ---- Input parsing --------------------------------------------------------------------------------
@@ -142,26 +166,34 @@ const isAttested = (m?: IrisMessage): m is IrisMessage & { message: Hex } =>
 const word = (b: Hex) => (b.startsWith('0x000000000000000000000000') ? `0x${b.slice(26)}` : b).toLowerCase()
 
 // MessageV2 header (148 bytes) + BurnMessageV2 body: https://developers.circle.com/cctp/references/technical-guide
+// Only USDC moving to or from Injective decodes: on that side of the message, sender (outbound) or recipient (inbound) is the TokenMessenger.
 function decodeBurn(message: Hex) {
   const field = (offset: number, length: number) => slice(message, offset, offset + length)
-  if (size(message) < 376 || !same(word(field(76, 32)), TOKEN_MESSENGER)) return // not a token burn
+  if (size(message) < 376) return
+  const sourceDomain = hexToNumber(field(4, 4))
+  const destinationDomain = hexToNumber(field(8, 4))
+  const local = sourceDomain === INJECTIVE_DOMAIN ? field(44, 32) : destinationDomain === INJECTIVE_DOMAIN ? field(76, 32) : undefined
+  if (!local || !same(word(local), TOKEN_MESSENGER)) return
   return {
-    destinationDomain: hexToNumber(field(8, 4)),
+    destinationDomain,
     destinationCaller: word(field(108, 32)),
+    fast: hexToNumber(field(140, 4)) <= 1000,
     recipient: word(field(184, 32)),
     amount: hexToBigInt(field(216, 32)),
     sender: word(field(248, 32)),
+    feeExecuted: hexToBigInt(field(312, 32)),
     expirationBlock: hexToBigInt(field(344, 32)),
+    forward: size(message) >= 388 && same(field(376, 12), FORWARD_HOOK),
   }
 }
 
-// Finds the supported EVM chain a tx hash belongs to.
+// Finds the EVM chain a tx hash belongs to.
 async function locate(hash: Hex): Promise<{ domain: number; receipt?: TransactionReceipt }> {
   const indexed = domainOf(hash)
   if (indexed !== undefined) return { domain: indexed }
   try {
     return await Promise.any(
-      sources.map(async ({ domain, client }) => {
+      chains.map(async ({ domain, client }) => {
         const receipt = await Promise.race([client.getTransactionReceipt({ hash }), Bun.sleep(8000).then(() => Promise.reject())])
         indexReceipt(domain, receipt)
         return { domain, receipt }
@@ -174,15 +206,24 @@ async function locate(hash: Hex): Promise<{ domain: number; receipt?: Transactio
 
 // CCTP messages emitted on the source chain, in log order.
 async function sentMessages(domain: number, hash: Hex, receipt?: TransactionReceipt): Promise<Hex[]> {
-  const client = sources.find((s) => s.domain === domain)?.client
-  receipt ??= await client?.getTransactionReceipt({ hash }).catch(() => undefined)
+  receipt ??= await chainOf(domain)?.client.getTransactionReceipt({ hash }).catch(() => undefined)
   if (!receipt) return []
   return parseEventLogs({ abi: [MessageSent], logs: receipt.logs })
     .filter((log) => same(log.address, MESSAGE_TRANSMITTER))
     .map((log) => log.args.message)
 }
 
-// Resolves every transfer to Injective in a burn transaction, with its current status.
+// Whether the destination chain already minted a message (undefined for chains we can't read).
+async function minted(domain: number, nonce: Hex) {
+  const chain = chainOf(domain)
+  if (!chain) return
+  const used = await chain.client.readContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'usedNonces', args: [nonce] }).catch(() => {
+    throw new HttpError(502, `Could not reach ${chain.name}, try again.`)
+  })
+  return used !== 0n
+}
+
+// Resolves every transfer to or from Injective in a burn transaction, with its current status.
 async function inspect(input: string, domainHint?: number): Promise<Found[]> {
   const { hash, domain: hinted } = parseTx(input, domainHint)
   const { domain, receipt } = hinted === undefined ? await locate(hash) : { domain: hinted, receipt: undefined }
@@ -199,14 +240,19 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
     const m = messages[i]
     const raw = isAttested(m) ? m.message : (onchain ??= await sentMessages(domain, hash, receipt))[i]
     const burn = raw && decodeBurn(raw)
-    if (raw && burn?.destinationDomain !== INJECTIVE_DOMAIN) continue
+    // Without the bytes (non-EVM sources before attestation) a transfer is assumed to be headed to Injective.
+    if (raw ? !burn : domain === INJECTIVE_DOMAIN) continue
+    const destination = burn?.destinationDomain ?? INJECTIVE_DOMAIN
     found.push({
       burn,
+      iris: m,
       message: isAttested(m) ? m.message : undefined,
       attestation: isAttested(m) ? (m.attestation as Hex) : undefined,
       transfer: {
         sourceDomain: domain,
         sourceChain: domainName(domain) ?? `Domain ${domain}`,
+        destinationDomain: destination,
+        destinationChain: domainName(destination) ?? `Domain ${destination}`,
         txHash: hash,
         txUrl: txUrl(domain, hash),
         nonce: m?.eventNonce,
@@ -214,33 +260,47 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
         sender: burn?.sender,
         recipient: burn?.recipient,
         status: 'pending',
-        note: m ? "Waiting for Circle's attestation, this can take up to ~20 minutes." : 'Waiting for Circle to pick up the burn.',
+        note: !m
+          ? 'Waiting for Circle to pick up the burn.'
+          : `Waiting for Circle's attestation, ${!burn?.fast && SLOW_FINALITY[domain] ? `this can take ${SLOW_FINALITY[domain]}` : 'usually under a minute'}.`,
       },
     })
   }
-  if (!found.length) throw new HttpError(404, 'This transaction did not send USDC to Injective.')
+  if (!found.length) throw new HttpError(404, 'This transaction did not move USDC to or from Injective.')
 
-  await Promise.all(
-    found.map(async ({ transfer: t, burn, attestation }) => {
-      if (!attestation || !burn) return
-      t.note = undefined
-      if (await injective.readContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'usedNonces', args: [t.nonce!] })) {
-        t.status = 'redeemed'
-        t.redeemTx = redeemTxOf(t.nonce!)
-        t.redeemTxUrl = t.redeemTx && txUrl(INJECTIVE_DOMAIN, t.redeemTx)
-      } else if (!/^0x0+$/.test(burn.destinationCaller) && !same(burn.destinationCaller, relayer?.account.address)) {
-        t.status = 'restricted'
-        t.note = `Only ${burn.destinationCaller} can redeem this transfer.`
-      } else if (burn.amount < minRedeemAmount) {
-        t.status = 'restricted'
-        t.note = `Transfers below ${formatUnits(minRedeemAmount, 6)} USDC are not redeemed by this service.`
-      } else {
-        t.status = 'ready'
-      }
-    }),
-  )
+  await Promise.all(found.map(resolve))
   if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(domain, hash)
   return found
+}
+
+// An attested transfer is minted already, on its way through Circle's Forwarding Service, or ready to mint.
+async function resolve({ transfer: t, burn, iris: m, message, attestation }: Found) {
+  if (!attestation || !burn) return
+  const inbound = t.destinationDomain === INJECTIVE_DOMAIN
+  t.note = undefined
+  if (burn.feeExecuted) t.fee = formatUnits(burn.feeExecuted, 6)
+  const mintTx = m?.destinationMintTxHash ?? (m?.forwardState === 'COMPLETE' ? m.forwardTxHash : null) ?? undefined
+  if (mintTx || (await minted(t.destinationDomain, t.nonce!))) {
+    t.status = 'redeemed'
+    t.redeemTx = mintTx ?? redeemTxOf(t.nonce!)
+    t.redeemTxUrl = t.redeemTx && txUrl(t.destinationDomain, t.redeemTx)
+  } else if (!inbound && burn.forward && (!m?.forwardState || m.forwardState === 'PENDING')) {
+    t.note = `Circle is delivering it to ${t.destinationChain}.`
+  } else if (!/^0x0+$/.test(burn.destinationCaller) && !(inbound && same(burn.destinationCaller, relayer?.account.address))) {
+    t.status = 'restricted'
+    t.note = `Only ${burn.destinationCaller} can redeem this transfer.`
+  } else if (inbound && burn.amount < minRedeemAmount) {
+    t.status = 'restricted'
+    t.note = `Transfers below ${formatUnits(minRedeemAmount, 6)} USDC are not redeemed by this service, claim it with your wallet.`
+    t.message = message
+    t.attestation = attestation
+  } else {
+    t.status = 'ready'
+    // Lets the recipient (or any app) mint it with receiveMessage on the destination chain.
+    t.message = message
+    t.attestation = attestation
+    if (!inbound) t.note = burn.forward ? `Circle could not deliver it, claim it on ${t.destinationChain}.` : `Ready to claim on ${t.destinationChain}.`
+  }
 }
 
 // ---- Public API -----------------------------------------------------------------------------------
@@ -259,31 +319,74 @@ export async function lookupAddress(input: string) {
   return { address, transfers }
 }
 
+// Mints the tx's transfers to Injective that are ready, and queues the rest to be minted as soon as Circle attests them.
 export async function redeem(hash: string, domain?: number) {
   if (!relayer) throw new HttpError(503, 'Redeeming is disabled on this server.')
   const found = await inspect(hash, domain)
-  const ready = found.filter((f) => f.transfer.status === 'ready')
-  if (!ready.length) {
-    const blocked = found.find((f) => f.transfer.status !== 'redeemed')?.transfer
+  const inbound = found.filter((f) => f.transfer.destinationDomain === INJECTIVE_DOMAIN)
+  if (!inbound.length) throw new HttpError(409, 'Transfers from Injective are minted on the destination chain, not by this service.')
+  const ready = inbound.filter((f) => f.transfer.status === 'ready')
+  const pending = inbound.filter((f) => f.transfer.status === 'pending')
+  if (!ready.length && !pending.length) {
+    const blocked = inbound.find((f) => f.transfer.status !== 'redeemed')?.transfer
     throw new HttpError(409, blocked ? (blocked.note ?? 'This transfer cannot be redeemed yet.') : 'This transfer has already been redeemed.')
   }
-  await Promise.all(
-    ready.map(async (f) => {
-      const t = f.transfer
-      try {
-        t.redeemTx = await submit(f)
-        t.redeemTxUrl = txUrl(INJECTIVE_DOMAIN, t.redeemTx)
-        t.status = 'redeemed'
-      } catch (err) {
-        const reason = describe(err)
-        console.error(`[redeem] ${t.txHash} (${t.nonce}): ${reason}`)
-        if (reason === 'Nonce already used') t.status = 'redeemed'
-        else t.note = `Redeem failed: ${reason}`
-      }
-    }),
-  )
-  if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(found[0]!.transfer.sourceDomain, found[0]!.transfer.txHash)
-  return { transfers: found.map((f) => f.transfer) }
+  await mint(ready)
+  const { sourceDomain, txHash } = found[0]!.transfer
+  // Whatever isn't minted yet (still pending, or a failed attempt) is retried by autoRedeem.
+  if (inbound.some((f) => f.transfer.status === 'pending' || f.transfer.status === 'ready')) enqueue(sourceDomain, txHash)
+  for (const { transfer: t } of pending) t.note = `${t.note} It will be minted automatically.`
+  if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(sourceDomain, txHash)
+  return { transfers: found.map((f) => f.transfer), queued: !ready.length }
+}
+
+export async function balance(domain: number, address: string) {
+  const chain = chainOf(domain)
+  if (!chain) throw new HttpError(400, `Unsupported chain (domain ${domain}).`)
+  const owner = parseAddress(address)
+  const units = await chain.client.readContract({ address: chain.usdc, abi: erc20Abi, functionName: 'balanceOf', args: [owner] }).catch(() => {
+    throw new HttpError(502, `Could not reach ${chain.name}, try again.`)
+  })
+  return { balance: formatUnits(units, 6) }
+}
+
+// ---- Fees -----------------------------------------------------------------------------------------
+
+export type Fees = { fastBps: number | null; forwardFee: string | null; standardTime: string | null }
+const feeCache = new Map<string, { expires: number; fees: Promise<Fees> }>()
+
+// fastBps: Fast Transfer fee in bps of the amount, null when the source only has standard transfers.
+// forwardFee: USDC that Circle's Forwarding Service takes to mint a transfer from Injective on the destination,
+// null when it can't deliver there (the recipient then claims it on the destination chain).
+// standardTime: average wait for a standard transfer, null when it's under a minute.
+export async function fees(from: number, to: number): Promise<Fees> {
+  if (!domainName(from) || !domainName(to) || from === to || (from !== INJECTIVE_DOMAIN && to !== INJECTIVE_DOMAIN))
+    throw new HttpError(400, 'Only routes to or from Injective are supported.')
+  const key = `${from}:${to}`
+  let entry = feeCache.get(key)
+  if (!entry || entry.expires < Date.now()) {
+    entry = { expires: Date.now() + 60_000, fees: loadFees(from, to) }
+    feeCache.set(key, entry)
+    entry.fees.catch(() => feeCache.delete(key))
+  }
+  return entry.fees
+}
+
+async function loadFees(from: number, to: number): Promise<Fees> {
+  const path = `/v2/burn/USDC/fees/${from}/${to}`
+  const outbound = from === INJECTIVE_DOMAIN
+  let res = await iris(outbound ? `${path}?forward=true` : path)
+  const forwarding = outbound && res.ok // Circle answers 400 for destinations it can't forward to
+  if (outbound && !res.ok) res = await iris(path)
+  if (!res.ok) throw new HttpError(502, `Circle fee API error (${res.status}).`)
+  const list = (await res.json()) as { finalityThreshold: number; minimumFee: number; forwardFee?: { med: number } }[]
+  const fast = list.find((f) => f.finalityThreshold === 1000)?.minimumFee ?? 0
+  const forwardFee = list.find((f) => f.finalityThreshold === 2000)?.forwardFee?.med
+  return {
+    fastBps: fast > 0 ? fast : null,
+    forwardFee: forwarding && forwardFee !== undefined ? formatUnits(BigInt(forwardFee), 6) : null,
+    standardTime: SLOW_FINALITY[from] ?? null,
+  }
 }
 
 // ---- Relayer --------------------------------------------------------------------------------------
@@ -311,12 +414,32 @@ function submit(f: Found): Promise<Hex> {
   return job
 }
 
+// Each transfer's status and note say how its attempt went.
+async function mint(ready: Found[]) {
+  await Promise.all(
+    ready.map(async (f) => {
+      const t = f.transfer
+      try {
+        t.redeemTx = await submit(f)
+        t.redeemTxUrl = txUrl(INJECTIVE_DOMAIN, t.redeemTx)
+        t.status = 'redeemed'
+      } catch (err) {
+        const reason = describe(err)
+        console.error(`[redeem] ${t.txHash} (${t.nonce}): ${reason}`)
+        if (reason === 'Nonce already used') t.status = 'redeemed'
+        else t.note = `Redeem failed: ${reason}`
+      }
+      if (t.status === 'redeemed') t.message = t.attestation = undefined
+    }),
+  )
+}
+
 async function send({ transfer, message, attestation }: Found): Promise<Hex> {
   const args = [message!, attestation!] as const
-  const gas = await injective.estimateContractGas({ account: relayer!.account, address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'receiveMessage', args })
+  const gas = await injective.client.estimateContractGas({ account: relayer!.account, address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'receiveMessage', args })
   // Padded: USDC on Injective runs a compliance hook on mint that fails when the gas limit is tight.
   const hash = await relayer!.writeContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'receiveMessage', args, gas: (gas * 3n) / 2n })
-  const receipt = await injective.waitForTransactionReceipt({ hash, timeout: 60_000 })
+  const receipt = await injective.client.waitForTransactionReceipt({ hash, timeout: 60_000 })
   if (receipt.status !== 'success') throw new Error(`transaction ${hash} reverted`)
   saveRedeem(transfer.nonce!, hash)
   console.log(`[redeem] ${transfer.amount} USDC from ${transfer.sourceChain} to ${transfer.recipient}: ${hash}`)
@@ -326,7 +449,7 @@ async function send({ transfer, message, attestation }: Found): Promise<Hex> {
 // Fast-transfer attestations expire ~24h after signing, until Circle re-signs them on request.
 async function refreshIfExpired(f: Found): Promise<Found> {
   const expiry = f.burn?.expirationBlock
-  if (!expiry || expiry > (await injective.getBlockNumber())) return f
+  if (!expiry || expiry > (await injective.client.getBlockNumber())) return f
   const { nonce, sourceDomain, txHash } = f.transfer
   const res = await iris(`/v2/reattest/${nonce}`, { method: 'POST' })
   if (!res.ok) throw new Error(`the attestation expired and Circle refused to re-sign it (${res.status})`)
@@ -334,7 +457,7 @@ async function refreshIfExpired(f: Found): Promise<Found> {
     await Bun.sleep(5000)
     const m = (await fetchMessages(sourceDomain, txHash)).find((x) => x.eventNonce === nonce)
     const burn = isAttested(m) ? decodeBurn(m.message) : undefined
-    if (burn && (!burn.expirationBlock || burn.expirationBlock > (await injective.getBlockNumber())))
+    if (burn && (!burn.expirationBlock || burn.expirationBlock > (await injective.client.getBlockNumber())))
       return { ...f, burn, message: m!.message!, attestation: m!.attestation as Hex }
   }
   throw new Error('the attestation expired and Circle has not re-signed it yet, try again in a few minutes')
@@ -345,4 +468,40 @@ function describe(err: unknown) {
   if (err.walk((e) => e instanceof InsufficientFundsError)) return 'the relayer is out of gas funds, please contact the operator'
   const revert = err.walk((e) => e instanceof ContractFunctionRevertedError)
   return (revert instanceof ContractFunctionRevertedError && revert.reason) || err.shortMessage
+}
+
+// ---- Auto-redeem ----------------------------------------------------------------------------------
+
+const QUEUE_HOURS = 72
+const nextCheck = new Map<string, number>()
+
+// Mints queued transfers once Circle attests them. A tx is checked every 10 s at first, backing off to every 5 min as it ages.
+export async function autoRedeem() {
+  if (!relayer) return
+  while (true) {
+    await Bun.sleep(5000)
+    for (const { domain, txHash, added } of queuedTxs()) {
+      const key = `${domain}:${txHash}`
+      const now = Date.now()
+      if (now - added > QUEUE_HOURS * 3_600_000) {
+        dequeue(domain, txHash)
+        nextCheck.delete(key)
+        continue
+      }
+      if ((nextCheck.get(key) ?? 0) > now) continue
+      nextCheck.set(key, now + Math.min(Math.max((now - added) / 10, 10_000), 300_000))
+      try {
+        const found = await inspect(txHash, domain)
+        const inbound = found.filter((f) => f.transfer.destinationDomain === INJECTIVE_DOMAIN)
+        await mint(inbound.filter((f) => f.transfer.status === 'ready'))
+        if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(domain, txHash)
+        if (inbound.every((f) => f.transfer.status === 'redeemed' || f.transfer.status === 'restricted')) {
+          dequeue(domain, txHash)
+          nextCheck.delete(key)
+        }
+      } catch (err) {
+        if (!(err instanceof HttpError)) console.error(`[auto-redeem] ${txHash}:`, err)
+      }
+    }
+  }
 }

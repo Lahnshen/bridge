@@ -13,7 +13,7 @@ sudo systemctl restart inj-cctp-redeemer
 # Fail the deploy (and the GitHub Action) if the API doesn't come back up.
 port=$(sed -n 's/^PORT=//p' backend/.env 2>/dev/null || true)
 for _ in $(seq 20); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:${port:-3000}/health"; then
+  if curl -fs -o /dev/null "http://127.0.0.1:${port:-3000}/health"; then
     echo "Deployed $(git rev-parse --short HEAD)"
     exit 0
   fi

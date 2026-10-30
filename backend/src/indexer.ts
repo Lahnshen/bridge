@@ -1,8 +1,8 @@
 import { Database } from 'bun:sqlite'
 import { BaseError, parseAbiItem, parseEventLogs, type Hex, type TransactionReceipt } from 'viem'
-import { dbPath, INJECTIVE_DOMAIN, lookbackHours, pollMs, sources, TOKEN_MESSENGER, type Source } from './config'
+import { chains, dbPath, INJECTIVE_DOMAIN, lookbackHours, pollMs, TOKEN_MESSENGER, type EvmChain } from './config'
 
-// Watches every EVM source chain for burns headed to Injective, so transfers can be looked up by wallet address.
+// Watches every EVM chain for burns to Injective, and Injective for burns leaving it, so transfers can be looked up by wallet address.
 
 const DepositForBurn = parseAbiItem(
   'event DepositForBurn(address indexed burnToken, uint256 amount, address indexed depositor, bytes32 mintRecipient, uint32 destinationDomain, bytes32 destinationTokenMessenger, bytes32 destinationCaller, uint256 maxFee, uint32 indexed minFinalityThreshold, bytes hookData)',
@@ -25,6 +25,8 @@ db.run('CREATE INDEX IF NOT EXISTS burns_sender ON burns (sender)')
 db.run('CREATE INDEX IF NOT EXISTS burns_recipient ON burns (recipient)')
 db.run('CREATE TABLE IF NOT EXISTS cursors (domain INTEGER PRIMARY KEY, block INTEGER NOT NULL)')
 db.run('CREATE TABLE IF NOT EXISTS redeems (nonce TEXT PRIMARY KEY, tx_hash TEXT NOT NULL)')
+// Burn txs to mint automatically once Circle attests them (see autoRedeem in cctp.ts).
+db.run('CREATE TABLE IF NOT EXISTS queue (domain INTEGER NOT NULL, tx_hash TEXT NOT NULL, added INTEGER NOT NULL, PRIMARY KEY (domain, tx_hash))')
 
 const insertBurn = db.query('INSERT OR IGNORE INTO burns (domain, tx_hash, log_index, sender, recipient) VALUES (?, ?, ?, ?, ?)')
 const getCursor = db.query<{ block: number }, [number]>('SELECT block FROM cursors WHERE domain = ?')
@@ -32,7 +34,7 @@ const setCursor = db.query('INSERT OR REPLACE INTO cursors (domain, block) VALUE
 
 function saveBurns(domain: number, burns: Burn[]) {
   for (const { transactionHash, logIndex, args } of burns) {
-    if (args.destinationDomain !== INJECTIVE_DOMAIN) continue
+    if (domain !== INJECTIVE_DOMAIN && args.destinationDomain !== INJECTIVE_DOMAIN) continue
     insertBurn.run(domain, transactionHash.toLowerCase(), logIndex, args.depositor.toLowerCase(), `0x${args.mintRecipient.slice(26)}`.toLowerCase())
   }
 }
@@ -59,14 +61,19 @@ export const saveRedeem = (nonce: string, txHash: string) => db.query('INSERT OR
 export const redeemTxOf = (nonce: string) =>
   db.query<{ tx_hash: string }, [string]>('SELECT tx_hash FROM redeems WHERE nonce = ?').get(nonce)?.tx_hash
 
+// Hashes are stored as given: parseTx already lowercases 0x hashes, and Solana signatures are case-sensitive.
+export const enqueue = (domain: number, txHash: string) => db.query('INSERT OR IGNORE INTO queue VALUES (?, ?, ?)').run(domain, txHash, Date.now())
+export const dequeue = (domain: number, txHash: string) => db.query('DELETE FROM queue WHERE domain = ? AND tx_hash = ?').run(domain, txHash)
+export const queuedTxs = () => db.query<{ domain: number; txHash: string; added: number }, []>('SELECT domain, tx_hash AS txHash, added FROM queue').all()
+
 export const indexedBlocks = () =>
-  Object.fromEntries(sources.map((s) => [s.name, getCursor.get(s.domain)?.block ?? null]))
+  Object.fromEntries(chains.map((chain) => [chain.name, getCursor.get(chain.domain)?.block ?? null]))
 
 export function startIndexer() {
-  for (const source of sources) void scan(source)
+  for (const chain of chains) void scan(chain)
 }
 
-async function scan({ domain, name, rpcEnv, client }: Source) {
+async function scan({ domain, name, rpcEnv, client }: EvmChain) {
   let cursor = getCursor.get(domain)?.block
   let step = 1000 // public RPCs cap eth_getLogs ranges differently, so the range adapts on errors
   let failures = 0
@@ -99,7 +106,7 @@ async function scan({ domain, name, rpcEnv, client }: Source) {
 }
 
 // Converts the lookback window into a block count using the chain's recent block time.
-async function lookbackBlocks(client: Source['client'], head: number) {
+async function lookbackBlocks(client: EvmChain['client'], head: number) {
   if (lookbackHours <= 0) return 0
   const sample = Math.min(head, 1000)
   const [from, to] = await Promise.all([client.getBlock({ blockNumber: BigInt(head - sample) }), client.getBlock({ blockNumber: BigInt(head) })])

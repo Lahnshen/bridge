@@ -9,6 +9,7 @@
   import { getBalance, getFees, INJECTIVE, type Fees, type Hex } from '$lib/api'
   import { app, injective, navigate, remotes } from '$lib/app.svelte'
   import { encode, FORWARD_HOOK, formatUsdc, parseRecipient, parseUsdc, short, usdcString } from '$lib/evm'
+  import { history, historyKey, updateHistory } from '$lib/history.svelte'
   import { addRecent, failRecent, recent, refresh, setTransfer } from '$lib/transfers.svelte'
   import { call, connectWallet, sendTx, switchChain, waitForReceipt, wallet, walletError } from '$lib/wallet.svelte'
   import ChainSelect from './ChainSelect.svelte'
@@ -158,10 +159,12 @@
 
   // ---- Sent transfer --------------------------------------------------------------------------------
 
-  const opened = $derived(recent.find((r) => r.txHash === app.open))
+  // Sent from here, or from the wallet's history.
+  const opened = $derived(recent.find((r) => r.txHash === app.open) ?? history.transfers.find((t) => historyKey(t) === app.open))
   const heading = $derived.by(() => {
     if (!opened) return ''
-    const claim = !!opened.transfer?.message && (opened.status === 'restricted' || (opened.status === 'ready' && (opened.destinationDomain !== INJECTIVE || !app.config!.autoRedeem)))
+    const message = 'createdAt' in opened ? opened.transfer?.message : opened.message
+    const claim = !!message && (opened.status === 'restricted' || (opened.status === 'ready' && (opened.destinationDomain !== INJECTIVE || !app.config!.autoRedeem)))
     if (claim) return 'Ready to claim'
     return { confirming: 'Sending', pending: 'On its way', ready: 'Almost there', redeemed: 'Arrived', restricted: 'Needs attention', failed: 'Transfer failed' }[opened.status]
   })
@@ -170,14 +173,14 @@
 {#snippet choice(label: string, options: { title: string; hint?: string; on: boolean; pick: () => void }[])}
   <div class="flex items-center justify-between gap-3">
     <span class="text-muted-foreground">{label}</span>
-    <div class="bg-muted/70 flex rounded-full p-0.5" role="radiogroup" aria-label={label}>
+    <div class="bg-muted/70 flex rounded-md p-0.5" role="radiogroup" aria-label={label}>
       {#each options as option (option.title)}
         <button
           type="button"
           role="radio"
           aria-checked={option.on}
           disabled={!!busy}
-          class={['h-6 rounded-full px-2.5 transition-colors', option.on ? 'bg-background text-foreground shadow-xs dark:bg-white/12' : 'text-muted-foreground hover:text-foreground']}
+          class={['h-6 rounded-sm px-2.5 transition-colors', option.on ? 'bg-background text-foreground shadow-xs dark:bg-white/12' : 'text-muted-foreground hover:text-foreground']}
           onclick={option.pick}
         >
           {option.title}{#if option.hint}<span class="text-muted-foreground ml-1">{option.hint}</span>{/if}
@@ -192,7 +195,7 @@
     <ArrowLeftIcon class="size-3.5" /> New transfer
   </button>
   <h1 class="mt-3 mb-5 font-serif text-[26px] leading-tight tracking-tight">{heading}</h1>
-  <TransferCard item={opened} onupdate={(transfer) => setTransfer(opened, transfer)} />
+  <TransferCard item={opened} onupdate={(transfer) => ('createdAt' in opened ? setTransfer(opened, transfer) : updateHistory(transfer))} />
 {:else}
   <h1 class="font-serif text-[26px] leading-tight tracking-tight">Bridge USDC</h1>
   <p class="text-muted-foreground mt-1">To and from Injective with Circle CCTP.</p>
@@ -204,7 +207,7 @@
       void submit()
     }}
   >
-    <div class="bg-card rounded-2xl border p-4 shadow-xs">
+    <div class="bg-card rounded-lg border p-4 shadow-xs">
       <div class="flex items-center justify-between gap-3">
         <span class="text-muted-foreground text-xs">From</span>
         <ChainSelect value={source} chains={remotes()} label="From" disabled={!!busy} onchange={outbound ? undefined : (chain) => (remote = chain)} />
@@ -235,7 +238,7 @@
     <div class="relative z-10 flex h-1 items-center justify-center">
       <button
         type="button"
-        class="bg-card hover:bg-muted flex size-8 items-center justify-center rounded-full border shadow-xs transition-colors"
+        class="bg-card hover:bg-muted flex size-8 items-center justify-center rounded-md border shadow-xs transition-colors"
         aria-label="Swap direction"
         disabled={!!busy}
         onclick={() => (outbound = !outbound)}
@@ -244,7 +247,7 @@
       </button>
     </div>
 
-    <div class="bg-card rounded-2xl border p-4 shadow-xs">
+    <div class="bg-card rounded-lg border p-4 shadow-xs">
       <div class="flex items-center justify-between gap-3">
         <span class="text-muted-foreground text-xs">To</span>
         <ChainSelect value={destination} chains={remotes()} label="To" disabled={!!busy} onchange={outbound ? (chain) => (remote = chain) : undefined} />
@@ -320,7 +323,7 @@
       </div>
     </div>
 
-    <Button type="submit" class="mt-5 h-11 w-full rounded-full text-[13px]" disabled={!!busy || (!!wallet.address && !!problem)}>
+    <Button type="submit" class="mt-5 h-11 w-full text-[13px]" disabled={!!busy || (!!wallet.address && !!problem)}>
       {#if busy}<Spinner class="size-4" />{busy}{:else if !wallet.address}Connect wallet{:else}{problem ?? `Bridge to ${destination.name}`}{/if}
     </Button>
     {#if error}

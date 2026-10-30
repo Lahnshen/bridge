@@ -2,7 +2,7 @@ import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
 import { autoRedeem, balance, fees, history, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
 import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, TOKEN_MESSENGER, trustProxy } from './config'
-import { indexedBlocks, queuedTxs, startIndexer } from './indexer'
+import { historyFrom, indexedBlocks, queuedTxs, startIndexer } from './indexer'
 
 // Fixed-window counter per client IP.
 function rateLimit(max: number, windowMs = 60_000) {
@@ -73,6 +73,7 @@ const app = new Elysia()
     balance: relayer ? await injective.client.getBalance({ address: relayer.account.address }).then(formatEther, () => null) : null,
     queued: queuedTxs().length,
     indexedBlocks: indexedBlocks(),
+    historyFromBlock: historyFrom(), // how far back Injective's history is indexed so far
   }))
   .get('/chains', () => chainInfo)
   .get('/fees/:from/:to', ({ params }) => fees(params.from, params.to), {

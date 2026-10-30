@@ -20,7 +20,7 @@
   const destination = $derived(chainOf(item.destinationDomain))
   const sourceName = $derived(t?.sourceChain ?? source?.name ?? `Domain ${item.sourceDomain}`)
   const destinationName = $derived(t?.destinationChain ?? destination?.name ?? `Domain ${item.destinationDomain}`)
-  const sourceUrl = $derived(t?.txUrl ?? (source?.explorer && `${source.explorer}/tx/${item.txHash}`))
+  const sourceUrl = $derived(t?.txUrl ?? (source?.explorer && item.txHash && `${source.explorer}/tx/${item.txHash}`))
   const sent = $derived(t?.time && new Date(t.time * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
   const note = $derived(local?.note ?? t?.note ?? (item.status === 'confirming' ? `Waiting for ${sourceName} to confirm the transaction.` : undefined))
 
@@ -93,7 +93,7 @@
   }
 </script>
 
-<article class="bg-card rounded-2xl border shadow-xs">
+<article class="bg-card rounded-lg border shadow-xs">
   <header class="flex items-center gap-3 px-4 pt-4">
     <span class="flex shrink-0 -space-x-1.5">
       <ChainIcon domain={item.sourceDomain} name={sourceName} class="ring-card size-6 text-[11px] ring-2" />
@@ -158,7 +158,7 @@
       <Button
         size="sm"
         variant={action === 'queue' ? 'outline' : 'default'}
-        class="rounded-full px-3.5"
+        class="px-3.5"
         disabled={!!busy}
         title={action === 'queue' ? 'Mint it on Injective as soon as Circle attests it' : undefined}
         onclick={action === 'claim' ? claim : serverRedeem}

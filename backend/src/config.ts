@@ -17,6 +17,8 @@ export const minRedeemAmount = parseUnits(env.MIN_REDEEM_USDC || '0', 6)
 export const dbPath = env.DB_PATH || 'cctp.sqlite'
 export const lookbackHours = num(env.INDEX_LOOKBACK_HOURS, 72)
 export const pollMs = num(env.INDEX_POLL_SECONDS, 30) * 1000
+// Injective block where CCTP V2 was deployed. Injective's side of every transfer is indexed back to it, for full wallet history.
+export const historyFromBlock = testnet ? undefined : 158_605_712
 
 export const IRIS_API = testnet ? 'https://iris-api-sandbox.circle.com' : 'https://iris-api.circle.com'
 export const INJECTIVE_DOMAIN = 29

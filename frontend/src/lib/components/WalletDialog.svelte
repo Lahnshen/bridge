@@ -31,7 +31,7 @@
 
 <dialog
   bind:this={dialog}
-  class="bg-popover text-popover-foreground backdrop:bg-black/50 m-auto w-[min(100%-2rem,22rem)] rounded-2xl border p-0 shadow-2xl backdrop:backdrop-blur-[2px]"
+  class="bg-popover text-popover-foreground backdrop:bg-black/50 m-auto w-[min(100%-2rem,22rem)] rounded-lg border p-0 shadow-2xl backdrop:backdrop-blur-[2px]"
   aria-labelledby="wallet-title"
   onclose={() => (wallet.picking = false)}
   onclick={(event) => event.target === dialog && dialog?.close()}
@@ -45,14 +45,14 @@
   <div class="flex flex-col gap-1 px-2 pb-2">
     {#each wallet.available as option (option.id)}
       <button
-        class="hover:bg-muted flex h-11 items-center gap-3 rounded-xl px-2.5 text-left text-[13px] font-medium transition-colors disabled:opacity-60"
+        class="hover:bg-muted flex h-11 items-center gap-3 rounded-md px-2.5 text-left text-[13px] font-medium transition-colors disabled:opacity-60"
         disabled={!!connecting}
         onclick={() => pick(option.id)}
       >
         {#if option.icon}
-          <img src={option.icon} alt="" class="size-7 rounded-lg" />
+          <img src={option.icon} alt="" class="size-7 rounded-md" />
         {:else}
-          <span class="bg-muted flex size-7 items-center justify-center rounded-lg"><WalletIcon class="size-4" /></span>
+          <span class="bg-muted flex size-7 items-center justify-center rounded-md"><WalletIcon class="size-4" /></span>
         {/if}
         <span class="flex-1">{option.name}</span>
         {#if connecting === option.id}<Spinner class="text-muted-foreground size-4" />{/if}

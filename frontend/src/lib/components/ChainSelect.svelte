@@ -36,7 +36,7 @@
     items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus()
   }
 
-  const pill = 'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-muted/80 pr-2.5 pl-1.5 text-[13px] font-medium'
+  const pill = 'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-muted/80 pr-2.5 pl-1.5 text-[13px] font-medium'
 </script>
 
 <svelte:window onpointerdown={(event) => open && !root?.contains(event.target as Node) && close(false)} />
@@ -70,7 +70,7 @@
       role="listbox"
       tabindex="-1"
       aria-label={label}
-      class="bg-popover animate-in fade-in-0 zoom-in-95 absolute top-full right-0 z-30 mt-1.5 max-h-72 w-52 origin-top-right overflow-y-auto rounded-xl border p-1 shadow-xl"
+      class="bg-popover animate-in fade-in-0 zoom-in-95 absolute top-full right-0 z-30 mt-1.5 max-h-72 w-52 origin-top-right overflow-y-auto rounded-lg border p-1 shadow-xl"
       onkeydown={keydown}
     >
       {#each chains as chain (chain.domain)}
@@ -78,7 +78,7 @@
           type="button"
           role="option"
           aria-selected={chain.domain === value.domain}
-          class="hover:bg-muted focus-visible:bg-muted flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] outline-none"
+          class="hover:bg-muted focus-visible:bg-muted flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] outline-none"
           onclick={() => pick(chain)}
         >
           <ChainIcon domain={chain.domain} name={chain.name} class="size-[18px] text-[9px]" />

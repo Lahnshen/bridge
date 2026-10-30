@@ -30,18 +30,21 @@ import {
   txUrl,
 } from './config'
 import {
-  addressTxs,
   burnTime,
   dequeue,
   doneTransfers,
   domainOf,
   enqueue,
+  historyRows,
   indexReceipt,
+  linkMint,
   markRedeemed,
+  mintOf,
   queuedTxs,
   redeemTxOf,
   saveRedeem,
   unredeemedTxs,
+  type MintRow,
 } from './indexer'
 
 export class HttpError extends Error {
@@ -287,6 +290,7 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
   if (!found.length) throw new HttpError(404, 'This transaction did not move USDC to or from Injective.')
 
   await Promise.all(found.map(resolve))
+  for (const { transfer: t } of found) if (t.nonce && t.destinationDomain === INJECTIVE_DOMAIN) linkMint(t.nonce, hash)
   if (found.every((f) => f.transfer.status === 'redeemed')) finish(found)
   return found
 }
@@ -303,7 +307,7 @@ async function resolve({ transfer: t, burn, iris: m, message, attestation }: Fou
   const inbound = t.destinationDomain === INJECTIVE_DOMAIN
   t.note = undefined
   if (burn.feeExecuted) t.fee = formatUnits(burn.feeExecuted, 6)
-  const mintTx = m?.destinationMintTxHash ?? (m?.forwardState === 'COMPLETE' ? m.forwardTxHash : null) ?? undefined
+  const mintTx = m?.destinationMintTxHash ?? (m?.forwardState === 'COMPLETE' ? m.forwardTxHash : null) ?? (inbound ? mintOf(t.nonce!)?.txHash : undefined)
   if (mintTx || (await minted(t.destinationDomain, t.nonce!))) {
     t.status = 'redeemed'
     t.redeemTx = mintTx ?? redeemTxOf(t.nonce!)
@@ -345,20 +349,55 @@ export async function lookupAddress(input: string) {
 
 const HISTORY_PAGE = 20
 
-// Every indexed transfer from or to an address, newest first, a page of txs at a time.
+// Everything indexed that moved USDC from or to an address, newest first, a page at a time.
 export async function history(input: string, offset = 0) {
   const address = parseAddress(input)
-  const txs = addressTxs(address, HISTORY_PAGE + 1, offset)
-  const page = txs.slice(0, HISTORY_PAGE)
-  const results = await Promise.allSettled(page.map((tx) => inspect(tx.txHash, tx.domain)))
+  let rows = historyRows(address, HISTORY_PAGE + 1, offset)
+  // Linking a mint to its burn tx also drops that tx from the page, where it would show up twice.
+  const unlinked = rows.filter((r) => r.kind === 'mint' && !r.txHash)
+  if (unlinked.length) {
+    await Promise.all(unlinked.map((r) => sourceTxOf(r.domain, r.nonce!).then((tx) => tx && linkMint(r.nonce!, tx), () => {})))
+    rows = historyRows(address, HISTORY_PAGE + 1, offset)
+  }
+  const page = rows.slice(0, HISTORY_PAGE)
+  const results = await Promise.allSettled(
+    page.map(async (r) => (r.kind === 'mint' ? [mintTransfer(mintOf(r.nonce!)!)] : (await inspect(r.txHash!, r.domain)).map((f) => f.transfer))),
+  )
   // One tx failing shouldn't hide the rest, but if Circle or the RPCs are down for all of them, say so.
   const failed = results.filter((r) => r.status === 'rejected')
   if (page.length && failed.length === page.length) throw failed[0]!.reason
   const transfers = results
     .flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
-    .map((f) => f.transfer)
     .filter((t) => same(t.recipient, address) || same(t.sender, address))
-  return { address, transfers, next: txs.length > HISTORY_PAGE ? offset + HISTORY_PAGE : null }
+  return { address, transfers, next: rows.length > HISTORY_PAGE ? offset + HISTORY_PAGE : null }
+}
+
+// A transfer that was minted on Injective, as far as the mint event tells.
+function mintTransfer(m: MintRow): Transfer {
+  return {
+    sourceDomain: m.sourceDomain,
+    sourceChain: domainName(m.sourceDomain) ?? `Domain ${m.sourceDomain}`,
+    destinationDomain: INJECTIVE_DOMAIN,
+    destinationChain: injective.name,
+    txHash: m.sourceTx ?? '',
+    txUrl: m.sourceTx ? txUrl(m.sourceDomain, m.sourceTx) : undefined,
+    nonce: m.nonce,
+    amount: formatUnits(BigInt(m.amount), 6),
+    fee: m.fee === '0' ? undefined : formatUnits(BigInt(m.fee), 6),
+    sender: m.sender,
+    recipient: m.recipient,
+    status: 'redeemed',
+    redeemTx: m.txHash,
+    redeemTxUrl: txUrl(INJECTIVE_DOMAIN, m.txHash),
+    time: m.time,
+  }
+}
+
+async function sourceTxOf(domain: number, nonce: string) {
+  const res = await iris(`/v2/messages/${domain}?nonce=${nonce}`)
+  if (!res.ok) return
+  const { sourceTxHash } = (await res.json()) as { sourceTxHash?: string }
+  return sourceTxHash && /^0x/.test(sourceTxHash) ? sourceTxHash.toLowerCase() : sourceTxHash
 }
 
 // Mints the tx's transfers to Injective that are ready, and queues the rest to be minted as soon as Circle attests them.

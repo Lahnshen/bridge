@@ -60,7 +60,7 @@
 <p class="text-muted-foreground mt-1">Find any USDC transfer to or from Injective.</p>
 
 <form
-  class="bg-card focus-within:border-ring focus-within:ring-ring/30 mt-6 flex h-12 items-center gap-2.5 rounded-full border pr-1.5 pl-4 shadow-xs transition-shadow focus-within:ring-3"
+  class="bg-card focus-within:border-ring focus-within:ring-ring/30 mt-6 flex h-12 items-center gap-2.5 rounded-lg border pr-1.5 pl-4 shadow-xs transition-shadow focus-within:ring-3"
   onsubmit={(event) => {
     event.preventDefault()
     void search()
@@ -77,7 +77,7 @@
   />
   <button
     type="submit"
-    class="bg-primary text-primary-foreground hover:bg-primary/90 flex size-9 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-40"
+    class="bg-primary text-primary-foreground hover:bg-primary/90 flex size-9 shrink-0 items-center justify-center rounded-md transition-colors disabled:opacity-40"
     aria-label="Search"
     disabled={loading || !query.trim()}
   >
@@ -94,7 +94,7 @@
     {#each results as transfer, i (`${transfer.txHash}:${transfer.nonce ?? i}`)}
       <TransferCard item={transfer} onupdate={update} />
     {:else}
-      <p class="text-muted-foreground rounded-2xl border border-dashed px-4 py-6 text-center text-xs">No pending transfers for this address.</p>
+      <p class="text-muted-foreground rounded-lg border border-dashed px-4 py-6 text-center text-xs">No pending transfers for this address.</p>
     {/each}
   </div>
 {:else if !error}

@@ -1,24 +1,29 @@
 <script lang="ts">
   import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right'
-  import HistoryIcon from '@lucide/svelte/icons/history'
   import SearchIcon from '@lucide/svelte/icons/search'
   import injectiveLogo from './assets/injective.svg'
   import Account from '$lib/components/Account.svelte'
   import Bridge from '$lib/components/Bridge.svelte'
-  import History from '$lib/components/History.svelte'
   import RecentList from '$lib/components/RecentList.svelte'
   import Track from '$lib/components/Track.svelte'
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
   import WalletDialog from '$lib/components/WalletDialog.svelte'
   import { app, loadConfig, navigate } from '$lib/app.svelte'
+  import { loadHistory } from '$lib/history.svelte'
+  import { wallet } from '$lib/wallet.svelte'
 
   void loadConfig()
+
+  // The wallet's indexed transfers fill the Recent list, refreshed when the wallet changes or the tab comes back.
+  $effect(() => {
+    if (wallet.address) void loadHistory(wallet.address)
+  })
+  const refreshHistory = () => document.visibilityState === 'visible' && wallet.address && loadHistory(wallet.address)
 
   const NAV = [
     { view: 'bridge', label: 'Bridge', icon: ArrowLeftRightIcon },
     { view: 'track', label: 'Track', icon: SearchIcon },
-    { view: 'history', label: 'History', icon: HistoryIcon },
   ] as const
   const current = (view: typeof app.view) => app.view === view && !(view === 'bridge' && app.open)
 </script>
@@ -35,6 +40,8 @@
   </span>
 {/snippet}
 
+<svelte:document onvisibilitychange={refreshHistory} />
+
 <div class="flex min-h-svh">
   <aside class="bg-sidebar text-sidebar-foreground border-sidebar-border sticky top-0 hidden h-svh w-60 shrink-0 flex-col border-r md:flex">
     <div class="flex h-14 items-center px-4">{@render brand()}</div>
@@ -42,7 +49,7 @@
       {#each NAV as item (item.view)}
         <button
           class={[
-            'flex h-8 items-center gap-2.5 rounded-lg px-2 text-left transition-colors',
+            'flex h-8 items-center gap-2.5 rounded-md px-2 text-left transition-colors',
             current(item.view) ? 'bg-foreground/[0.07] text-foreground' : 'text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground',
           ]}
           aria-current={current(item.view) ? 'page' : undefined}
@@ -65,10 +72,10 @@
 
     <main class="dots flex-1 px-4 pt-6 pb-20 md:pt-[12vh]">
       <div class="mx-auto w-full max-w-[26rem]">
-        <div class="bg-muted/70 mb-8 grid grid-cols-3 rounded-full p-0.5 md:hidden">
+        <div class="bg-muted/70 mb-8 grid grid-cols-2 rounded-md p-0.5 md:hidden">
           {#each NAV as item (item.view)}
             <button
-              class={['h-8 rounded-full text-[13px] font-medium transition-colors', app.view === item.view ? 'bg-background shadow-xs dark:bg-white/12' : 'text-muted-foreground']}
+              class={['h-8 rounded-sm text-[13px] font-medium transition-colors', app.view === item.view ? 'bg-background shadow-xs dark:bg-white/12' : 'text-muted-foreground']}
               onclick={() => navigate(item.view)}
             >
               {item.label}
@@ -79,11 +86,10 @@
         {#if app.config}
           <div class={{ hidden: app.view !== 'bridge' }}><Bridge /></div>
           <div class={{ hidden: app.view !== 'track' }}><Track /></div>
-          <div class={{ hidden: app.view !== 'history' }}><History /></div>
         {:else if app.error}
           <div class="flex flex-col items-center gap-4 pt-16 text-center">
             <p class="text-muted-foreground">{app.error}</p>
-            <Button variant="outline" size="sm" class="rounded-full px-4" onclick={loadConfig}>Try again</Button>
+            <Button variant="outline" size="sm" class="px-4" onclick={loadConfig}>Try again</Button>
           </div>
         {:else}
           <div class="flex justify-center pt-20"><Spinner class="text-muted-foreground size-5" /></div>

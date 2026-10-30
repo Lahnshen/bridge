@@ -21,6 +21,7 @@
   const sourceName = $derived(t?.sourceChain ?? source?.name ?? `Domain ${item.sourceDomain}`)
   const destinationName = $derived(t?.destinationChain ?? destination?.name ?? `Domain ${item.destinationDomain}`)
   const sourceUrl = $derived(t?.txUrl ?? (source?.explorer && `${source.explorer}/tx/${item.txHash}`))
+  const sent = $derived(t?.time && new Date(t.time * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
   const note = $derived(local?.note ?? t?.note ?? (item.status === 'confirming' ? `Waiting for ${sourceName} to confirm the transaction.` : undefined))
 
   let busy = $state('')
@@ -98,12 +99,13 @@
       <ChainIcon domain={item.sourceDomain} name={sourceName} class="ring-card size-6 text-[11px] ring-2" />
       <ChainIcon domain={item.destinationDomain} name={destinationName} class="ring-card size-6 text-[11px] ring-2" />
     </span>
-    <div class="min-w-0">
+    <div class="min-w-0 flex-1">
       <p class="text-[15px] leading-tight font-semibold tracking-tight tabular-nums">{formatAmount(t?.amount ?? local?.amount)} USDC</p>
       <p class="text-muted-foreground truncate text-xs">
         {sourceName} → {destinationName}{#if t?.recipient}&nbsp;· to <span class="font-mono">{short(t.recipient)}</span>{/if}
       </p>
     </div>
+    {#if sent}<time class="text-muted-foreground shrink-0 self-start text-[11px]" datetime={new Date(t!.time! * 1000).toISOString()}>{sent}</time>{/if}
   </header>
 
   <ol class="flex items-center gap-2 px-4 pt-4 text-xs" aria-label="Progress">

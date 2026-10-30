@@ -1,6 +1,6 @@
 import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
-import { autoRedeem, balance, fees, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
+import { autoRedeem, balance, fees, history, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
 import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, TOKEN_MESSENGER, trustProxy } from './config'
 import { indexedBlocks, queuedTxs, startIndexer } from './indexer'
 
@@ -82,6 +82,9 @@ const app = new Elysia()
     params: t.Object({ domain: domainId, address: t.String() }),
   })
   .get('/address/:address', ({ params }) => lookupAddress(params.address))
+  .get('/history/:address', ({ params, query }) => history(params.address, query.offset), {
+    query: t.Object({ offset: t.Optional(t.Integer({ minimum: 0 })) }),
+  })
   .get('/tx/:hash', ({ params, query }) => lookupTx(params.hash, query.domain), {
     query: t.Object({ domain: t.Optional(domainId) }),
   })

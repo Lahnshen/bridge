@@ -1,9 +1,11 @@
 <script lang="ts">
   import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right'
+  import HistoryIcon from '@lucide/svelte/icons/history'
   import SearchIcon from '@lucide/svelte/icons/search'
   import injectiveLogo from './assets/injective.svg'
   import Account from '$lib/components/Account.svelte'
   import Bridge from '$lib/components/Bridge.svelte'
+  import History from '$lib/components/History.svelte'
   import RecentList from '$lib/components/RecentList.svelte'
   import Track from '$lib/components/Track.svelte'
   import { Button } from '$lib/components/ui/button'
@@ -16,6 +18,7 @@
   const NAV = [
     { view: 'bridge', label: 'Bridge', icon: ArrowLeftRightIcon },
     { view: 'track', label: 'Track', icon: SearchIcon },
+    { view: 'history', label: 'History', icon: HistoryIcon },
   ] as const
   const current = (view: typeof app.view) => app.view === view && !(view === 'bridge' && app.open)
 </script>
@@ -62,7 +65,7 @@
 
     <main class="dots flex-1 px-4 pt-6 pb-20 md:pt-[12vh]">
       <div class="mx-auto w-full max-w-[26rem]">
-        <div class="bg-muted/70 mb-8 grid grid-cols-2 rounded-full p-0.5 md:hidden">
+        <div class="bg-muted/70 mb-8 grid grid-cols-3 rounded-full p-0.5 md:hidden">
           {#each NAV as item (item.view)}
             <button
               class={['h-8 rounded-full text-[13px] font-medium transition-colors', app.view === item.view ? 'bg-background shadow-xs dark:bg-white/12' : 'text-muted-foreground']}
@@ -76,6 +79,7 @@
         {#if app.config}
           <div class={{ hidden: app.view !== 'bridge' }}><Bridge /></div>
           <div class={{ hidden: app.view !== 'track' }}><Track /></div>
+          <div class={{ hidden: app.view !== 'history' }}><History /></div>
         {:else if app.error}
           <div class="flex flex-col items-center gap-4 pt-16 text-center">
             <p class="text-muted-foreground">{app.error}</p>

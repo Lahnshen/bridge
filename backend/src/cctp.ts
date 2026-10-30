@@ -29,7 +29,20 @@ import {
   TOKEN_MESSENGER,
   txUrl,
 } from './config'
-import { dequeue, domainOf, enqueue, indexReceipt, markRedeemed, queuedTxs, redeemTxOf, saveRedeem, unredeemedTxs } from './indexer'
+import {
+  addressTxs,
+  burnTime,
+  dequeue,
+  doneTransfers,
+  domainOf,
+  enqueue,
+  indexReceipt,
+  markRedeemed,
+  queuedTxs,
+  redeemTxOf,
+  saveRedeem,
+  unredeemedTxs,
+} from './indexer'
 
 export class HttpError extends Error {
   status: number
@@ -57,6 +70,7 @@ export type Transfer = {
   redeemTxUrl?: string
   message?: Hex
   attestation?: Hex
+  time?: number // burn's block time (unix seconds), once the indexer has it
 }
 
 type Burn = NonNullable<ReturnType<typeof decodeBurn>>
@@ -227,6 +241,9 @@ async function minted(domain: number, nonce: Hex) {
 async function inspect(input: string, domainHint?: number): Promise<Found[]> {
   const { hash, domain: hinted } = parseTx(input, domainHint)
   const { domain, receipt } = hinted === undefined ? await locate(hash) : { domain: hinted, receipt: undefined }
+  const time = burnTime(domain, hash)
+  const done = doneTransfers<Transfer>(domain, hash)
+  if (done) return done.map((transfer) => ({ transfer: { ...transfer, time } }))
 
   // Circle lists the tx's messages in log order, but leaves out the message bytes until it has
   // attested them. Until then, the MessageSent events on the source chain tell us where funds go.
@@ -259,6 +276,7 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
         amount: burn && formatUnits(burn.amount, 6),
         sender: burn?.sender,
         recipient: burn?.recipient,
+        time,
         status: 'pending',
         note: !m
           ? 'Waiting for Circle to pick up the burn.'
@@ -269,8 +287,14 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
   if (!found.length) throw new HttpError(404, 'This transaction did not move USDC to or from Injective.')
 
   await Promise.all(found.map(resolve))
-  if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(domain, hash)
+  if (found.every((f) => f.transfer.status === 'redeemed')) finish(found)
   return found
+}
+
+// Once every transfer in a tx is minted nothing about it changes, so it's stored and Circle isn't asked again.
+function finish(found: Found[]) {
+  const { sourceDomain, txHash } = found[0]!.transfer
+  markRedeemed(sourceDomain, txHash, found.map(({ transfer: { time, ...rest } }) => rest))
 }
 
 // An attested transfer is minted already, on its way through Circle's Forwarding Service, or ready to mint.
@@ -319,6 +343,24 @@ export async function lookupAddress(input: string) {
   return { address, transfers }
 }
 
+const HISTORY_PAGE = 20
+
+// Every indexed transfer from or to an address, newest first, a page of txs at a time.
+export async function history(input: string, offset = 0) {
+  const address = parseAddress(input)
+  const txs = addressTxs(address, HISTORY_PAGE + 1, offset)
+  const page = txs.slice(0, HISTORY_PAGE)
+  const results = await Promise.allSettled(page.map((tx) => inspect(tx.txHash, tx.domain)))
+  // One tx failing shouldn't hide the rest, but if Circle or the RPCs are down for all of them, say so.
+  const failed = results.filter((r) => r.status === 'rejected')
+  if (page.length && failed.length === page.length) throw failed[0]!.reason
+  const transfers = results
+    .flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
+    .map((f) => f.transfer)
+    .filter((t) => same(t.recipient, address) || same(t.sender, address))
+  return { address, transfers, next: txs.length > HISTORY_PAGE ? offset + HISTORY_PAGE : null }
+}
+
 // Mints the tx's transfers to Injective that are ready, and queues the rest to be minted as soon as Circle attests them.
 export async function redeem(hash: string, domain?: number) {
   if (!relayer) throw new HttpError(503, 'Redeeming is disabled on this server.')
@@ -336,7 +378,7 @@ export async function redeem(hash: string, domain?: number) {
   // Whatever isn't minted yet (still pending, or a failed attempt) is retried by autoRedeem.
   if (inbound.some((f) => f.transfer.status === 'pending' || f.transfer.status === 'ready')) enqueue(sourceDomain, txHash)
   for (const { transfer: t } of pending) t.note = `${t.note} It will be minted automatically.`
-  if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(sourceDomain, txHash)
+  if (found.every((f) => f.transfer.status === 'redeemed')) finish(found)
   return { transfers: found.map((f) => f.transfer), queued: !ready.length }
 }
 
@@ -494,7 +536,7 @@ export async function autoRedeem() {
         const found = await inspect(txHash, domain)
         const inbound = found.filter((f) => f.transfer.destinationDomain === INJECTIVE_DOMAIN)
         await mint(inbound.filter((f) => f.transfer.status === 'ready'))
-        if (found.every((f) => f.transfer.status === 'redeemed')) markRedeemed(domain, txHash)
+        if (found.every((f) => f.transfer.status === 'redeemed')) finish(found)
         if (inbound.every((f) => f.transfer.status === 'redeemed' || f.transfer.status === 'restricted')) {
           dequeue(domain, txHash)
           nextCheck.delete(key)

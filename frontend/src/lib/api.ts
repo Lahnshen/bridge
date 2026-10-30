@@ -36,6 +36,7 @@ export type Transfer = {
   redeemTxUrl?: string
   message?: Hex
   attestation?: Hex
+  time?: number // when it was sent (unix seconds), for transfers the server has indexed
 }
 
 // fastBps: Fast Transfer fee (bps of the amount), forwardFee: USDC Circle takes to deliver from Injective,
@@ -71,6 +72,9 @@ export const getConfig = () => call<Config>('/chains')
 export const getFees = (from: number, to: number) => call<Fees>(`/fees/${from}/${to}`)
 export const getBalance = (domain: number, address: string) => call<{ balance: string }>(`/balance/${domain}/${address}`)
 export const getAddressTransfers = (address: string) => call<{ transfers: Transfer[] }>(`/address/${address}`)
+// A page of every transfer from or to an address, newest first. next is the offset of the next page.
+export const getHistory = (address: string, offset = 0) =>
+  call<{ transfers: Transfer[]; next: number | null }>(`/history/${address}?offset=${offset}`, undefined, 60_000)
 export const getTxTransfers = (hash: string, domain?: number) =>
   call<{ transfers: Transfer[] }>(`/tx/${hash}${domain === undefined ? '' : `?domain=${domain}`}`)
 export const redeem = (txHash: string, domain: number) =>

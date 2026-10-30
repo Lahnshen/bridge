@@ -7,7 +7,7 @@ export const linkedQuery = new URLSearchParams(location.search).get('q')?.trim()
 export const app = $state({
   config: undefined as Config | undefined,
   error: '',
-  view: (linkedQuery ? 'track' : 'bridge') as 'bridge' | 'track',
+  view: (linkedQuery ? 'track' : 'bridge') as 'bridge' | 'track' | 'history',
   open: undefined as string | undefined, // tx hash of the recent transfer shown instead of the bridge form
 })
 

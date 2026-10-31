@@ -34,7 +34,7 @@
       results = page.transfers
       next = page.next
       searched = q
-      history.replaceState(null, '', `?q=${encodeURIComponent(q)}`)
+      history.replaceState(null, '', `/track?q=${encodeURIComponent(q)}`)
     } catch (err) {
       if (id === latest) {
         error = (err as Error).message

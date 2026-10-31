@@ -22,12 +22,16 @@
   let error = $state('')
   let done = $state<SwapResult>()
 
+  // Reloaded whenever the tab is opened, so USDC bridged in meanwhile shows up.
   let balance = $state<bigint>()
   let balanceAttempt = $state(0)
+  let balanceOf: string | undefined
   $effect(() => {
     const address = wallet.address
     void balanceAttempt
-    balance = undefined
+    if (app.view !== 'swap') return
+    if (address !== balanceOf) balance = undefined
+    balanceOf = address
     if (!address) return
     let stale = false
     getBalance(INJECTIVE, address).then((result) => !stale && (balance = parseUsdc(result.balance)), () => {})

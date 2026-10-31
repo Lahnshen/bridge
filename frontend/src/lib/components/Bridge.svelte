@@ -368,6 +368,12 @@
           { title: 'Fast', hint: '< 1 min', on: fast, pick: () => (fast = true) },
           { title: 'Standard', hint: fees!.standardTime!, on: !fast, pick: () => (fast = false) },
         ])}
+      {:else if fees}
+        <!-- Chains with instant finality (Injective, Avalanche, Polygon…) have no faster option: standard already takes seconds. -->
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-muted-foreground">Speed</span>
+          <span>{fees.standardTime ?? 'Under a minute'}</span>
+        </div>
       {/if}
       {#if canForward && !mustForward}
         {@render choice('Delivery', [

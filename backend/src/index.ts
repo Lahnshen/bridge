@@ -1,8 +1,10 @@
 import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
 import { autoRedeem, balance, fees, history, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
-import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, TOKEN_MESSENGER, trustProxy } from './config'
+import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, solana, TOKEN_MESSENGER, trustProxy } from './config'
 import { historyFrom, indexedBlocks, queuedTxs, startIndexer } from './indexer'
+import { SolanaRpcError, solanaRpc } from './solana'
+import { resumeSwaps, swap, swapQuote, swapsEnabled } from './swap'
 
 // Fixed-window counter per client IP.
 function rateLimit(max: number, windowMs = 60_000) {
@@ -25,6 +27,7 @@ const limits = { requests: rateLimit(requestsPerMinute), redeems: rateLimit(rede
 const chainInfo = {
   network,
   autoRedeem: !!relayer,
+  swap: swapsEnabled, // USDC → INJ on Injective, see /swap
   tokenMessenger: TOKEN_MESSENGER,
   messageTransmitter: MESSAGE_TRANSMITTER,
   chains: chains.map(({ domain, name, chain, usdc }) => ({
@@ -36,8 +39,18 @@ const chainInfo = {
     explorer: chain.blockExplorers?.default.url,
     nativeCurrency: chain.nativeCurrency,
   })),
+  solana: {
+    domain: solana.domain,
+    name: solana.name,
+    usdc: solana.usdc,
+    rpc: solana.publicRpc,
+    explorer: solana.explorer,
+    tokenMessenger: solana.tokenMessenger,
+    messageTransmitter: solana.messageTransmitter,
+  },
 }
 const domainId = t.Integer({ minimum: 0 })
+const SOLANA_METHODS = new Set(['getLatestBlockhash', 'sendTransaction', 'getSignatureStatuses', 'getAccountInfo'])
 
 const app = new Elysia()
   .onRequest(({ request, server, set, status }) => {
@@ -50,7 +63,7 @@ const app = new Elysia()
 
     // Behind a proxy, the last X-Forwarded-For entry is the one the proxy added (earlier ones can be forged by the client).
     const ip = (trustProxy && request.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim()) || server?.requestIP(request)?.address || 'unknown'
-    const isRedeem = request.method === 'POST' && new URL(request.url).pathname === '/redeem'
+    const isRedeem = request.method === 'POST' && ['/redeem', '/swap'].includes(new URL(request.url).pathname) // these send transactions
     const hit = (isRedeem ? limits.redeems : limits.requests)(ip)
     set.headers['ratelimit-limit'] = String(hit.limit)
     set.headers['ratelimit-remaining'] = String(hit.remaining)
@@ -76,8 +89,9 @@ const app = new Elysia()
     historyFromBlock: historyFrom(), // how far back Injective's history is indexed so far
   }))
   .get('/chains', () => chainInfo)
-  .get('/fees/:from/:to', ({ params }) => fees(params.from, params.to), {
+  .get('/fees/:from/:to', ({ params, query }) => fees(params.from, params.to, query.recipientSetup === 'true'), {
     params: t.Object({ from: domainId, to: domainId }),
+    query: t.Object({ recipientSetup: t.Optional(t.String()) }),
   })
   .get('/balance/:domain/:address', ({ params }) => balance(params.domain, params.address), {
     params: t.Object({ domain: domainId, address: t.String() }),
@@ -88,6 +102,33 @@ const app = new Elysia()
   })
   .get('/tx/:hash', ({ params, query }) => lookupTx(params.hash, query.domain), {
     query: t.Object({ domain: t.Optional(domainId) }),
+  })
+  // The few Solana RPC calls the UI makes to send a transfer from Solana, through this server's RPC.
+  .post(
+    '/solana',
+    async ({ body }) => {
+      if (!SOLANA_METHODS.has(body.method)) throw new HttpError(400, 'Unsupported method.')
+      const result = await solanaRpc(body.method, body.params).catch((err: Error) => {
+        throw new HttpError(err instanceof SolanaRpcError ? 400 : 502, err instanceof SolanaRpcError ? err.message : `Could not reach ${solana.name}, try again.`)
+      })
+      return { result }
+    },
+    { body: t.Object({ method: t.String(), params: t.Array(t.Any(), { maxItems: 4 }) }) },
+  )
+  .get('/swap/quote', ({ query }) => swapQuote(query.amount), { query: t.Object({ amount: t.String() }) })
+  .post('/swap', async ({ body, status }) => {
+    const result = await swap(body)
+    return result.status === 'pending' ? status(202, result) : result
+  }, {
+    body: t.Object({
+      from: t.String(),
+      value: t.String(),
+      validAfter: t.Integer({ minimum: 0 }),
+      validBefore: t.Integer({ minimum: 0 }),
+      nonce: t.String(),
+      signature: t.String(),
+      minInj: t.String(),
+    }),
   })
   .post(
     '/redeem',
@@ -101,5 +142,6 @@ const app = new Elysia()
 
 startIndexer()
 void autoRedeem()
+void resumeSwaps()
 console.log(`Injective CCTP bridge API (${network}) on http://localhost:${app.server?.port}`)
 console.log(`Relayer: ${relayer?.account.address ?? 'disabled (set RELAYER_PRIVATE_KEY)'} · indexing ${chains.length} chains`)

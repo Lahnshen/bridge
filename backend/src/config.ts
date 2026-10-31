@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, fallback, http, parseUnits, type Chain, type Hex } from 'viem'
+import { createPublicClient, createWalletClient, defineChain, fallback, http, parseUnits, type Chain, type Hex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import * as c from 'viem/chains'
 
@@ -14,6 +14,7 @@ export const trustProxy = env.TRUST_PROXY === 'true'
 export const requestsPerMinute = num(env.RATE_LIMIT_PER_MINUTE, 120)
 export const redeemsPerMinute = num(env.REDEEM_LIMIT_PER_MINUTE, 5)
 export const minRedeemAmount = parseUnits(env.MIN_REDEEM_USDC || '0', 6)
+export const swapMaxUsdc = parseUnits(env.SWAP_MAX_USDC || '10000', 6)
 export const dbPath = env.DB_PATH || 'cctp.sqlite'
 export const lookbackHours = num(env.INDEX_LOOKBACK_HOURS, 72)
 export const pollMs = num(env.INDEX_POLL_SECONDS, 30) * 1000
@@ -27,7 +28,23 @@ export const SOLANA_DOMAIN = 5
 export const TOKEN_MESSENGER: Hex = testnet ? '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' : '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
 export const MESSAGE_TRANSMITTER: Hex = testnet ? '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275' : '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64'
 
-// CCTP V2 EVM chains: [domain, name, mainnet, USDC, testnet, testnet USDC]. Injective first, every other chain bridges to and from it.
+// Chains viem doesn't have yet. https://chainid.network
+const edge = defineChain({
+  id: 3343,
+  name: 'EDGE',
+  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: { default: { http: ['https://edge-mainnet.g.alchemy.com/public'] } },
+  blockExplorers: { default: { name: 'Alchemy Explorer', url: 'https://edge-mainnet.explorer.alchemy.com' } },
+})
+const pharos = defineChain({
+  id: 1672,
+  name: 'Pharos',
+  nativeCurrency: { name: 'PharosCoin', symbol: 'PROS', decimals: 18 },
+  rpcUrls: { default: { http: ['https://rpc.pharos.xyz'] } },
+  blockExplorers: { default: { name: 'PharosScan', url: 'https://pharosscan.xyz' } },
+})
+
+// CCTP V2 EVM chains: [domain, name, mainnet, USDC, testnet, testnet USDC]. Injective first: it's the default destination.
 // https://developers.circle.com/cctp/concepts/supported-chains-and-domains, https://developers.circle.com/stablecoins/usdc-contract-addresses
 const evmChains: [number, string, Chain, Hex, Chain?, Hex?][] = [
   [29, 'Injective', c.injective, '0xa00C59fF5a080D2b954d0c75e46E22a0c371235a', c.injectiveTestnet, '0x0C382e685bbeeFE5d3d9C29e29E341fEE8E84C5d'],
@@ -49,13 +66,16 @@ const evmChains: [number, string, Chain, Hex, Chain?, Hex?][] = [
   [21, 'Ink', c.ink, '0x2D270e6886d130D724215A266106e6832161EAEd', c.inkSepolia, '0xFabab97dCE620294D2B0b0e46C68964e326300Ac'],
   [22, 'Plume', c.plumeMainnet, '0x222365EF19F7947e5484218551B56bb3965Aa7aF', c.plumeSepolia, '0xcB5f30e335672893c7eb944B374c196392C19D18'],
   [26, 'Arc', c.arc, '0x3600000000000000000000000000000000000000', c.arcTestnet, '0x3600000000000000000000000000000000000000'],
+  [28, 'EDGE', edge, '0x98d2919b9A214E6Fa5384AC81E6864bA686Ad74c'],
   [30, 'Morph', c.morph, '0xCfb1186F4e93D60E60a8bDd997427D1F33bc372B'],
+  [31, 'Pharos', pharos, '0xC879C018dB60520F4355C26eD1a6D572cdAC1815'],
   [32, 'Cronos', c.cronos, '0x3D7F2C478aAfdB65542BCB44bCeeC05849999d2D', c.cronosTestnet, '0xEb33dc5fac03833e132593659e1dE7256aB59794'],
   [33, 'Plasma', c.plasma, '0x2d661C89D812261039AF9764eceaAee884f5F67F', c.plasmaTestnet, '0xE67Fb267022cBA8064Dd388CC2FED724F3120D9D'],
   [37, 'X Layer', c.xLayer, '0xB6CEceAB302E2E4948951eE7843FC24E92933061', c.xLayerTestnet, '0xDec90b78111Ba2fc6FC6d84d8B9ec159A2d4b9B3'],
 ]
 // Chains we can't scan: transfers from them can still be redeemed by tx hash (+ domain), and transfers to them are shown.
-const otherDomains: Record<number, string> = { 5: 'Solana', 8: 'Sui', 9: 'Aptos', 25: 'Starknet', 27: 'Stellar', 28: 'EDGE', 31: 'Pharos' }
+// (BNB Smart Chain, domain 17, only moves USYC; Sui and Aptos are on CCTP V1, which can't reach V2 chains.)
+const otherDomains: Record<number, string> = { 5: 'Solana', 8: 'Sui', 9: 'Aptos', 25: 'Starknet', 27: 'Stellar' }
 
 // RPC_<NAME> overrides the public RPC, e.g. RPC_ETHEREUM or RPC_OP_MAINNET. Comma-separate several URLs for fallback.
 const rpcEnv = (name: string) => `RPC_${name.toUpperCase().replace(/\W+/g, '_')}`
@@ -79,7 +99,21 @@ export const relayer = env.RELAYER_PRIVATE_KEY
   ? createWalletClient({ account: privateKeyToAccount(env.RELAYER_PRIVATE_KEY as Hex), chain: injective.chain, transport: transport(injective.rpcEnv) })
   : undefined
 
-export const domainName = (domain: number) => chainOf(domain)?.name ?? otherDomains[domain]
+// Solana's CCTP V2 programs, the same on mainnet and devnet: https://developers.circle.com/cctp/references/solana-programs
+export const solana = {
+  domain: SOLANA_DOMAIN,
+  name: testnet ? 'Solana Devnet' : 'Solana',
+  rpc: env.RPC_SOLANA?.split(',')[0]?.trim() || (testnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com'),
+  publicRpc: testnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
+  usdc: testnet ? '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU' : 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  tokenMessenger: 'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe', // TokenMessengerMinterV2
+  messageTransmitter: 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
+  explorer: 'https://solscan.io',
+}
+
+export const domainName = (domain: number) => chainOf(domain)?.name ?? (domain === SOLANA_DOMAIN ? solana.name : otherDomains[domain])
+// Chains the bridge UI can send from and to: the EVM chains and Solana.
+export const bridgeable = (domain: number) => !!chainOf(domain) || domain === SOLANA_DOMAIN
 
 export function txUrl(domain: number, hash: string) {
   if (domain === SOLANA_DOMAIN) return `https://solscan.io/tx/${hash}${testnet ? '?cluster=devnet' : ''}`

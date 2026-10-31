@@ -1,19 +1,21 @@
 # Injective CCTP Bridge
 
-A Circle CCTP bridge for native USDC **to and from Injective**. Users bridge with their browser wallet, and the backend finishes transfers to Injective for them: its relayer wallet mints the USDC on Injective and pays the gas. Anyone can also paste a wallet address or burn tx hash to find a transfer and redeem it.
+A Circle CCTP bridge for native USDC between 26 chains, built around **Injective**. Users bridge with their browser wallet (EVM or Solana), and the backend finishes transfers to Injective for them: its relayer wallet mints the USDC on Injective and pays the gas, so users need no INJ. Once there, they can swap some or all of it to INJ, gas free too. Anyone can paste a wallet address or burn tx hash to find a transfer, pending or completed, and redeem it.
 
 - `backend/`: Bun + Elysia + viem API. Built to be called by any app.
-- `frontend/`: Svelte 5 single page: bridge, track, recent transfers.
+- `frontend/`: Svelte 5 single page: bridge, get INJ, track, recent transfers.
 
 ## How it works
 
 1. A CCTP transfer burns USDC on the source chain (`depositForBurn` on TokenMessengerV2), Circle attests it, and someone calls `receiveMessage` on the destination chain to mint.
-2. **Bridging to Injective:** the UI burns from the user's wallet, then hands the tx to the backend (`POST /redeem`). The backend queues it and mints on Injective as soon as Circle attests (**auto-redeem**), so users need no INJ. From Ethereum and the L2s, users choose Fast (under a minute, a small Circle fee) or Standard (free, ~20 minutes, longer on Linea).
-3. **Bridging from Injective:** the burn asks Circle's [Forwarding Service](https://developers.circle.com/cctp/concepts/forwarding-service) to mint on the destination for a fee, so users need no gas there. Users can skip forwarding (or the route may not support it) and claim on the destination with their wallet instead.
-4. **Tx hash lookups** find the source chain automatically (by fetching the receipt from every supported EVM chain), then ask Circle's attestation API for the message, and check on the destination chain whether it was already minted.
-5. **Address lookups** use a small SQLite index: the backend watches `DepositForBurn` events on every EVM chain and stores the ones to or from Injective (domain 29), keyed by sender and recipient, with each burn's block time. It works with `0x…` and `inj1…` addresses.
-6. **Wallet history** (the UI's Recent list, once a wallet is connected) comes from Injective, which sees both sides of every transfer: burns leaving it, and `MessageReceived` for every mint arriving. Both are indexed back to CCTP's deployment on Injective (block 158,605,712, March 2026). The first start backfills that in the background, which takes 20–30 minutes on the public RPC; `GET /health` shows how far it got (`historyFromBlock`). Circle supplies a mint's source tx by nonce when it's first shown, and finished transfers are stored, so history pages don't ask Circle again.
-7. **Redeems** are simulated before sending (no gas wasted on reverts), sent one at a time from the relayer key, and deduplicated per message. Expired fast-transfer attestations are re-attested automatically. Queued transfers are retried for 72 hours.
+2. **Bridging to Injective** (the default route): the UI burns from the user's wallet, then hands the tx to the backend (`POST /redeem`). The backend queues it and mints on Injective as soon as Circle attests (**auto-redeem**), so users need no INJ. Where Circle offers it, users choose Fast (under a minute, a small Circle fee) or Standard (free, ~20 minutes on most chains, longer on Linea).
+3. **Bridging anywhere else** (from Injective, or between any two other chains): the burn asks Circle's [Forwarding Service](https://developers.circle.com/cctp/concepts/forwarding-service) to mint on the destination for a fee, so users need no gas there. To EVM chains users can skip forwarding and claim with their wallet instead. To Solana it's always forwarded; when the recipient has no USDC account yet, the burn asks Circle to create it (`includeRecipientSetup`) and the fee covers that too.
+4. **Solana** works without a Solana SDK: the UI builds the `deposit_for_burn` transaction itself, a Wallet Standard wallet (Phantom, Solflare, Backpack…) signs it, and the backend relays only a few read/send RPC methods (`POST /solana`). Recipients on Solana get the USDC in their associated token account. A burn costs about 0.003 SOL, mostly rent for the event account CCTP creates.
+5. **Tx hash lookups** find the source chain automatically (by fetching the receipt from every supported EVM chain, then Solana), then ask Circle's attestation API for the message, and check on the destination chain whether it was already minted. They work for any route.
+6. **Address lookups** (Track) use a small SQLite index: the backend watches `DepositForBurn` events on every EVM chain, keyed by sender and recipient, with each burn's block time. Burns to or from Injective are kept for good; burns between two other chains for 30 days. It works with `0x…`, `inj1…` and Solana addresses, and shows completed transfers as well as pending ones.
+7. **Wallet history** (the UI's Recent list, once a wallet is connected) comes from Injective, which sees both sides of every transfer: burns leaving it, and `MessageReceived` for every mint arriving. Both are indexed back to CCTP's deployment on Injective (block 158,605,712, March 2026). The first start backfills that in the background, which takes 20–30 minutes on the public RPC; `GET /health` shows how far it got (`historyFromBlock`). Circle supplies a mint's source tx by nonce when it's first shown, and finished transfers are stored, so history pages don't ask Circle again.
+8. **Redeems** are simulated before sending (no gas wasted on reverts), sent one at a time from the relayer key, and deduplicated per message. Expired fast-transfer attestations are re-attested automatically. Queued transfers are retried for 72 hours.
+9. **Get INJ** swaps USDC on Injective to INJ without the user paying gas. The wallet signs an EIP-3009 `ReceiveWithAuthorization` (a message, not a transaction) that lets only the relayer pull that much USDC. The relayer then pulls it, buys INJ with a market order on Injective's [INJ/USDC orderbook](https://injscan.com/market/0xa8c14f892f7f7d2516442220a05b652d5afee3f57a5495981dfad7c99ef78e84) through the exchange precompile, sends the INJ to the user, and sends back any USDC the order didn't use. Before pulling anything, the backend checks the book again against the user's minimum (quote − 0.5%); the order then pays at most 0.2% above that book, and whatever doesn't fill comes back as USDC. Each swap is stored, so after a restart the backend finishes it or refunds the USDC.
 
 ## Run it
 
@@ -124,13 +126,16 @@ All responses are JSON. Errors look like `{ "error": "message" }`.
 
 | Method | Path | Description |
 | - | - | - |
-| `GET` | `/chains` | What a bridge UI needs: network, whether auto-redeem is on, the CCTP contracts, and every chain's domain, chain ID, USDC address, public RPC and explorer. |
-| `GET` | `/fees/:from/:to` | Route quote by CCTP domain, one side must be Injective: `{ fastBps, forwardFee, standardTime }`. `fastBps` is the Fast Transfer fee in bps of the amount, `forwardFee` the USDC Circle takes to deliver a transfer from Injective, `standardTime` the usual wait for a standard transfer. Each is `null` when it doesn't apply. |
+| `GET` | `/chains` | What a bridge UI needs: network, whether auto-redeem and swaps are on, the CCTP contracts, every EVM chain's domain, chain ID, USDC address, public RPC and explorer, and Solana's programs and USDC mint. |
+| `GET` | `/fees/:from/:to?recipientSetup=` | Route quote by CCTP domain, for any two supported chains: `{ fastBps, forwardFee, standardTime }`. `fastBps` is the Fast Transfer fee in bps of the amount, `forwardFee` the USDC Circle takes to deliver it (never to Injective, where this service mints), `standardTime` the usual wait for a standard transfer. Each is `null` when it doesn't apply. `recipientSetup=true` (to Solana) includes creating the recipient's USDC account. |
 | `GET` | `/balance/:domain/:address` | USDC balance of an address on a chain: `{ "balance": "125.5" }`. |
-| `GET` | `/address/:address` | Pending (unredeemed) transfers sent from or to a `0x…` / `inj1…` address. |
+| `GET` | `/address/:address` | Pending (unredeemed) transfers sent from or to a `0x…`, `inj1…` or Solana address. |
 | `GET` | `/history/:address?offset=` | Every transfer from or to an address, newest first, 20 per page: `{ transfers, next }`. Pass `next` as `offset` for the following page; it's `null` on the last one. A mint whose source tx Circle couldn't name yet has an empty `txHash`. |
-| `GET` | `/tx/:hash?domain=` | Every transfer to or from Injective in a burn tx. `domain` (CCTP source domain) is optional for EVM chains and Solana; pass it for other non-EVM sources. |
+| `GET` | `/tx/:hash?domain=` | Every transfer in a burn tx (EVM tx hash or Solana signature). `domain` (CCTP source domain) is optional for EVM chains and Solana; pass it for other non-EVM sources. |
 | `POST` | `/redeem` | Body `{ "txHash": "0x…", "domain"?: 6 }`. Mints the tx's transfers to Injective that are ready, and queues the ones still waiting for Circle to be minted automatically. |
+| `GET` | `/swap/quote?amount=` | USDC → INJ quote from the live orderbook: `{ amount, inj, minInj, price, to, domain }`. `to` is the relayer (the authorization's recipient), `domain` the EIP-712 domain of USDC on Injective. |
+| `POST` | `/swap` | Body: the signed `ReceiveWithAuthorization` (`from`, `to`, `value`, `validAfter`, `validBefore`, `nonce`, `signature`) plus `minInj` from the quote. Returns `{ status, inj, refund, txHash, txUrl }`: `200` with `status: "done"`, or `202` with `"pending"` when the fill takes longer (the backend still finishes it). `409` when the price moved below `minInj`; nothing is pulled then. |
+| `POST` | `/solana` | JSON-RPC to Solana for the UI, limited to `getLatestBlockhash`, `sendTransaction`, `getSignatureStatuses` and `getAccountInfo`. |
 | `GET` | `/health` | Network, relayer address and INJ balance, queued transfers, last indexed block per chain, and how far back Injective's history is indexed. |
 
 Lookups and redeems return `{ "transfers": Transfer[] }`:
@@ -159,21 +164,22 @@ Lookups and redeems return `{ "transfers": Transfer[] }`:
 ```
 
 - `pending`: Circle hasn't attested the burn yet (or, from Injective, is still delivering it).
-- `ready`: can be minted now. This service mints transfers to Injective; transfers from Injective are claimed on the destination chain with `message` and `attestation`.
+- `ready`: can be minted now. This service mints transfers to Injective; others are claimed on the destination chain with `message` and `attestation`.
 - `redeemed`: already minted on the destination chain.
 - `restricted`: can't be redeemed by this service. The burn named a different `destinationCaller`, or it's below `MIN_REDEEM_USDC` (then `message` and `attestation` are included, so the recipient can claim it).
 
-`POST /redeem` returns `409` when nothing in the tx is redeemable (already minted, restricted, or a transfer from Injective). It returns `202` when everything left is queued for auto-redeem, and `200` otherwise; each transfer's `status` and `note` say how its attempt went.
+`POST /redeem` returns `409` when nothing in the tx is redeemable (already minted, restricted, or not headed to Injective). It returns `202` when everything left is queued for auto-redeem, and `200` otherwise; each transfer's `status` and `note` say how its attempt went.
 
-Status codes: `400` invalid input, `404` not found / not a transfer to or from Injective, `409` nothing to redeem, `429` rate limited, `502`/`503` upstream (Circle, RPC) or relayer issues.
+Status codes: `400` invalid input, `404` no USDC transfer found, `409` nothing to redeem, `429` rate limited, `502`/`503` upstream (Circle, RPC) or relayer issues.
 
-**Rate limits:** per IP, fixed one-minute windows: `RATE_LIMIT_PER_MINUTE` (default 120) for all requests, and a separate `REDEEM_LIMIT_PER_MINUTE` (default 5) for `POST /redeem`. Every response includes `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers. Calls to Circle are also paced globally so the server never trips Circle's own limit.
+**Rate limits:** per IP, fixed one-minute windows: `RATE_LIMIT_PER_MINUTE` (default 120) for all requests, and a separate `REDEEM_LIMIT_PER_MINUTE` (default 5) for `POST /redeem` and `POST /swap`. Every response includes `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers. Calls to Circle are also paced globally so the server never trips Circle's own limit.
 
 The UI also accepts deep links: `https://your-ui/?q=<address or tx hash>`.
 
 ## Notes
 
-- History covers every transfer that left or reached Injective. Transfers to Injective that were never minted, and Track's address search, only cover what the indexer has seen on the other chains: `INDEX_LOOKBACK_HOURS` before the first start, then everything going forward. Tx hash lookups work for any transfer, any age.
-- Bridge and indexed EVM chains: Ethereum, Avalanche, OP, Arbitrum, Base, Polygon, Unichain, Linea, Codex, Sonic, World Chain, Monad, Sei, XDC, HyperEVM, Ink, Plume, Arc, Morph, Cronos, Plasma, X Layer. Solana burns to Injective work by tx signature. Other sources (Sui, Aptos, Starknet, Stellar, EDGE, Pharos) can be looked up and redeemed through the API by passing their CCTP `domain`.
-- Circle's Forwarding Service delivers from Injective, not to it: transfers to Injective rely on this service's relayer (or the recipient claiming with their own wallet when `RELAYER_PRIVATE_KEY` is unset).
-- Keep the relayer wallet funded with a small amount of INJ. A standard mint costs about 350k gas (~0.00006 INJ at current prices). `GET /health` shows the balance.
+- History covers every transfer that left or reached Injective. Transfers to Injective that were never minted, and Track's address search, only cover what the indexer has seen on the other chains: `INDEX_LOOKBACK_HOURS` before the first start, then everything going forward (for 30 days on routes that don't touch Injective). Tx hash lookups work for any transfer, any age.
+- Chains: Injective, Solana, and the EVM chains Ethereum, Avalanche, OP, Arbitrum, Base, Polygon, Unichain, Linea, Codex, Sonic, World Chain, Monad, Sei, XDC, HyperEVM, Ink, Plume, Arc, EDGE, Morph, Pharos, Cronos, Plasma and X Layer. Left out of the UI: Starknet and Stellar (they need their own wallets; transfers from them can still be looked up and redeemed through the API by passing their CCTP `domain`), Sui and Aptos (CCTP V1 only), and BNB Smart Chain (CCTP moves USYC there, not USDC).
+- Circle's Forwarding Service delivers to every chain but Injective: transfers to Injective rely on this service's relayer (or the recipient claiming with their own wallet when `RELAYER_PRIVATE_KEY` is unset).
+- Keep the relayer wallet funded with a small amount of INJ, for gas only. A standard mint costs about 350k gas (~0.00006 INJ at current prices), a swap about the same for its (up to) four transactions. The INJ users get comes from their own order, not from the relayer. `GET /health` shows the balance.
+- Swaps run on mainnet only, need `RELAYER_PRIVATE_KEY`, and are capped by `SWAP_MAX_USDC` (default 10,000). The minimum is 1.10 USDC (the market's minimum order is 1 USDC). They go through the orderbook because Injective's swap precompile doesn't accept this USDC yet.

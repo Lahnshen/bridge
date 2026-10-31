@@ -1,12 +1,14 @@
 <script lang="ts">
   import ArrowUpRightIcon from '@lucide/svelte/icons/arrow-up-right'
   import CheckIcon from '@lucide/svelte/icons/check'
+  import FuelIcon from '@lucide/svelte/icons/fuel'
   import XIcon from '@lucide/svelte/icons/x'
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
-  import { INJECTIVE, redeem, type Transfer } from '$lib/api'
-  import { app, chainOf } from '$lib/app.svelte'
+  import { INJECTIVE, redeem, SOLANA, type EvmChain, type Transfer } from '$lib/api'
+  import { app, chainOf, navigate } from '$lib/app.svelte'
   import { encode, formatAmount, short } from '$lib/evm'
+  import { solanaAddress } from '$lib/solana'
   import type { Recent } from '$lib/transfers.svelte'
   import { connectWallet, sendTx, switchChain, waitForReceipt, wallet, walletError } from '$lib/wallet.svelte'
   import ChainIcon from './ChainIcon.svelte'
@@ -21,6 +23,8 @@
   const sourceName = $derived(t?.sourceChain ?? source?.name ?? `Domain ${item.sourceDomain}`)
   const destinationName = $derived(t?.destinationChain ?? destination?.name ?? `Domain ${item.destinationDomain}`)
   const sourceUrl = $derived(t?.txUrl ?? (source?.explorer && item.txHash && `${source.explorer}/tx/${item.txHash}`))
+  // Solana recipients are 32-byte keys (the USDC account), shown the way Solana shows them.
+  const recipient = $derived(t?.recipient && item.destinationDomain === SOLANA && /^0x[0-9a-f]{64}$/i.test(t.recipient) ? solanaAddress(t.recipient) : t?.recipient)
   const sent = $derived(t?.time && new Date(t.time * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
   const note = $derived(local?.note ?? t?.note ?? (item.status === 'confirming' ? `Waiting for ${sourceName} to confirm the transaction.` : undefined))
 
@@ -29,7 +33,8 @@
   let handedOver = $state(false)
 
   const serverMints = $derived(item.destinationDomain === INJECTIVE && !!app.config?.autoRedeem)
-  const claimable = $derived(!!t?.message && !!t.attestation && !!destination && (item.status === 'ready' || item.status === 'restricted'))
+  // This app claims on EVM chains only.
+  const claimable = $derived(!!t?.message && !!t.attestation && destination?.kind === 'evm' && (item.status === 'ready' || item.status === 'restricted'))
   const action = $derived(
     serverMints && item.status === 'ready'
       ? 'redeem'
@@ -72,7 +77,7 @@
   // The connected wallet mints it on the destination chain.
   async function claim() {
     if (!wallet.address) return connectWallet()
-    const chain = destination!
+    const chain = destination as EvmChain
     const { message, attestation } = t!
     error = ''
     try {
@@ -102,7 +107,7 @@
     <div class="min-w-0 flex-1">
       <p class="text-[15px] leading-tight font-semibold tracking-tight tabular-nums">{formatAmount(t?.amount ?? local?.amount)} USDC</p>
       <p class="text-muted-foreground truncate text-xs">
-        {sourceName} → {destinationName}{#if t?.recipient}&nbsp;· to <span class="font-mono">{short(t.recipient)}</span>{/if}
+        {sourceName} → {destinationName}{#if recipient}&nbsp;· to <span class="font-mono">{short(recipient)}</span>{/if}
       </p>
     </div>
     {#if sent}<time class="text-muted-foreground shrink-0 self-start text-[11px]" datetime={new Date(t!.time! * 1000).toISOString()}>{sent}</time>{/if}
@@ -154,6 +159,9 @@
         </a>
       {/if}
     </div>
+    {#if item.status === 'redeemed' && item.destinationDomain === INJECTIVE && app.config?.swap && !action}
+      <Button size="sm" variant="outline" class="px-3" onclick={() => navigate('swap')}><FuelIcon class="size-3.5" />Get INJ for gas</Button>
+    {/if}
     {#if action}
       <Button
         size="sm"

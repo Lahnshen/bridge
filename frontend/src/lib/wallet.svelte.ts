@@ -1,4 +1,4 @@
-import type { Chain, Hex } from './api'
+import type { EvmChain, Hex } from './api'
 
 // Browser wallets over EIP-1193, discovered with EIP-6963 (window.ethereum as a fallback).
 
@@ -19,7 +19,7 @@ export const wallet = $state({
   connected: undefined as WalletInfo | undefined,
   address: undefined as Hex | undefined,
   chainId: undefined as number | undefined,
-  picking: false, // the wallet picker dialog is open
+  picking: false as false | 'evm' | 'solana', // the wallet picker dialog is open, for this kind of wallet
 })
 
 function announce(info: WalletInfo, p: Provider) {
@@ -43,7 +43,7 @@ setTimeout(() => {
 export function connectWallet() {
   const [only, ...others] = wallet.available
   if (only && !others.length) return connect(only.id).catch(() => {})
-  wallet.picking = true
+  wallet.picking = 'evm'
 }
 
 export async function connect(id: string) {
@@ -94,7 +94,7 @@ async function request(method: string, params?: unknown) {
 const hex = (value: number | bigint) => `0x${value.toString(16)}`
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-export async function switchChain(chain: Chain) {
+export async function switchChain(chain: EvmChain) {
   // Asks the wallet rather than trusting wallet.chainId: a missed chainChanged event must not send a tx to the wrong chain.
   if (Number(await request('eth_chainId')) === chain.chainId) return void (wallet.chainId = chain.chainId)
   const chainId = hex(chain.chainId)
@@ -114,10 +114,13 @@ export async function switchChain(chain: Chain) {
 
 export const call = (to: Hex, data: Hex): Promise<Hex> => request('eth_call', [{ to, data }, 'latest'])
 
+// EIP-712 typed data, signed by the connected account. Wallets check its domain's chainId against the current chain.
+export const signTypedData = (data: object): Promise<Hex> => request('eth_signTypedData_v4', [wallet.address, JSON.stringify(data)])
+
 type Tx = { to: Hex; data: Hex }
 
 // chainId makes the wallet refuse the tx if the user changed networks in the meantime.
-export async function sendTx(chain: Chain, tx: Tx, { padGas = false } = {}): Promise<Hex> {
+export async function sendTx(chain: EvmChain, tx: Tx, { padGas = false } = {}): Promise<Hex> {
   const params = { from: wallet.address, chainId: hex(chain.chainId), ...tx }
   const gas = padGas ? (BigInt(await request('eth_estimateGas', [{ from: params.from, ...tx }])) * 3n) / 2n : undefined
   return request('eth_sendTransaction', [{ ...params, ...(gas && { gas: hex(gas) }) }])

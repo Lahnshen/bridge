@@ -1,6 +1,7 @@
 export type Hex = `0x${string}`
 
-export type Chain = {
+export type EvmChain = {
+  kind: 'evm'
   domain: number
   name: string
   chainId: number
@@ -10,12 +11,28 @@ export type Chain = {
   nativeCurrency: { name: string; symbol: string; decimals: number }
 }
 
+// Addresses are base58. tokenMessenger and messageTransmitter are the CCTP V2 programs.
+export type SolanaChain = {
+  kind: 'solana'
+  domain: number
+  name: string
+  usdc: string
+  rpc: string
+  explorer: string
+  tokenMessenger: string
+  messageTransmitter: string
+}
+
+export type Chain = EvmChain | SolanaChain
+
 export type Config = {
   network: 'mainnet' | 'testnet'
   autoRedeem: boolean
+  swap: boolean // USDC → INJ swaps for gas
   tokenMessenger: Hex
   messageTransmitter: Hex
-  chains: Chain[]
+  chains: Omit<EvmChain, 'kind'>[]
+  solana?: Omit<SolanaChain, 'kind'>
 }
 
 export type Transfer = {
@@ -44,6 +61,7 @@ export type Transfer = {
 export type Fees = { fastBps: number | null; forwardFee: string | null; standardTime: string | null }
 
 export const INJECTIVE = 29
+export const SOLANA = 5
 
 export class ApiError extends Error {
   status: number
@@ -65,11 +83,13 @@ async function call<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Pr
   return data
 }
 
-export const isTxHash = (q: string) => /^0x[0-9a-fA-F]{64}$/.test(q) || /^[1-9A-HJ-NP-Za-km-z]{43,90}$/.test(q)
-export const isAddress = (q: string) => /^0x[0-9a-fA-F]{40}$/.test(q) || /^inj1[02-9ac-hj-np-z]{38}$/i.test(q)
+// A Solana signature is 64 bytes (~88 base58 characters), a Solana address 32 (32–44 characters).
+export const isTxHash = (q: string) => /^0x[0-9a-fA-F]{64}$/.test(q) || /^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(q)
+export const isAddress = (q: string) => /^0x[0-9a-fA-F]{40}$/.test(q) || /^inj1[02-9ac-hj-np-z]{38}$/i.test(q) || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(q)
 
 export const getConfig = () => call<Config>('/chains')
-export const getFees = (from: number, to: number) => call<Fees>(`/fees/${from}/${to}`)
+// recipientSetup: to Solana, include creating the recipient's USDC account.
+export const getFees = (from: number, to: number, recipientSetup = false) => call<Fees>(`/fees/${from}/${to}${recipientSetup ? '?recipientSetup=true' : ''}`)
 export const getBalance = (domain: number, address: string) => call<{ balance: string }>(`/balance/${domain}/${address}`)
 export const getAddressTransfers = (address: string) => call<{ transfers: Transfer[] }>(`/address/${address}`)
 // A page of every transfer from or to an address, newest first. next is the offset of the next page.
@@ -77,6 +97,30 @@ export const getHistory = (address: string, offset = 0) =>
   call<{ transfers: Transfer[]; next: number | null }>(`/history/${address}?offset=${offset}`, undefined, 60_000)
 export const getTxTransfers = (hash: string, domain?: number) =>
   call<{ transfers: Transfer[] }>(`/tx/${hash}${domain === undefined ? '' : `?domain=${domain}`}`)
+// ---- USDC → INJ on Injective, gas free ----------------------------------------------------------------
+
+// What a swap of `amount` USDC buys now, and what the wallet signs to pay for it: an EIP-3009 ReceiveWithAuthorization
+// moving the USDC to the relayer (`to`), on the USDC contract's EIP-712 domain.
+export type SwapQuote = {
+  amount: string // USDC
+  inj: string // expected
+  minInj: string // the least the swap goes through for
+  price: string // USDC per INJ
+  to: Hex
+  domain: { name: string; version: string; chainId: number; verifyingContract: Hex }
+}
+export type SwapRequest = { from: Hex; value: string; validAfter: number; validBefore: number; nonce: Hex; signature: Hex; minInj: string }
+// pending: the order went through, and the server sends the INJ as soon as it sees the fill.
+export type SwapResult = { status: 'done' | 'pending'; txHash: Hex | null; txUrl?: string; inj: string; refund: string | null }
+
+export const getSwapQuote = (amount: string) => call<SwapQuote>(`/swap/quote?amount=${amount}`)
+export const swap = (body: SwapRequest) =>
+  call<SwapResult>('/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, 120_000)
+
+// The few Solana RPC calls a transfer from Solana needs, through the server.
+export const solanaRpc = async <T>(method: string, params: unknown[]) =>
+  (await call<{ result: T }>('/solana', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method, params }) })).result
+
 export const redeem = (txHash: string, domain: number) =>
   call<{ transfers: Transfer[] }>(
     '/redeem',

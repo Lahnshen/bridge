@@ -14,8 +14,13 @@ export type Burn = { amount: bigint; destinationDomain: number; mintRecipient: H
 const burnArgs = (b: Burn) =>
   word(b.amount) + word(b.destinationDomain) + address(b.mintRecipient) + address(b.burnToken) + word(0) + word(b.maxFee) + word(b.minFinalityThreshold)
 
-// Circle Forwarding Service hook, v0 without extra data: Circle mints on the destination chain for a fee.
-export const FORWARD_HOOK: Hex = '0x636374702d666f72776172640000000000000000000000000000000000000000'
+// Circle's Forwarding Service hook (v0): Circle mints on the destination chain for a fee. To Solana it can also create the
+// recipient's USDC account first, given the wallet (`setupFor`, 32 bytes hex). https://developers.circle.com/cctp/concepts/forwarding-service
+export function forwardHook(setupFor?: Hex): Hex {
+  const magic = '636374702d666f7277617264'.padEnd(48, '0') // "cctp-forward" in 24 bytes
+  if (!setupFor) return `0x${magic}${'0'.repeat(16)}` // version 0, no extra data
+  return `0x${magic}00000000${'00000021'}01${setupFor.slice(2)}` // version 0, 33 bytes: create the account, for this owner
+}
 
 export const encode = {
   approve: (spender: Hex, amount: bigint): Hex => `0x095ea7b3${address(spender)}${word(amount)}`,

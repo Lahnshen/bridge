@@ -4,6 +4,7 @@ import {
   erc20Abi,
   formatUnits,
   hexToBigInt,
+  hexToBytes,
   hexToNumber,
   InsufficientFundsError,
   parseAbi,
@@ -16,6 +17,7 @@ import {
   type TransactionReceipt,
 } from 'viem'
 import {
+  bridgeable,
   chainOf,
   chains,
   domainName,
@@ -25,6 +27,7 @@ import {
   MESSAGE_TRANSMITTER,
   minRedeemAmount,
   relayer,
+  solana,
   SOLANA_DOMAIN,
   TOKEN_MESSENGER,
   txUrl,
@@ -46,6 +49,7 @@ import {
   unredeemedTxs,
   type MintRow,
 } from './indexer'
+import { base58Encode, findProgramAddress, hexKey, publicKey, solanaRpc, usdcAccount } from './solana'
 
 export class HttpError extends Error {
   status: number
@@ -96,6 +100,7 @@ const transmitterAbi = parseAbi([
 const MessageSent = parseAbiItem('event MessageSent(bytes message)')
 // Hook data that asks Circle's Forwarding Service to mint on the destination chain: https://developers.circle.com/cctp/concepts/forwarding-service
 const FORWARD_HOOK = toHex('cctp-forward')
+const SOLANA_TOKEN_MESSENGER = hexKey(publicKey(solana.tokenMessenger)!)
 // Circle's average wait for a standard attestation, on the sources where it's more than a few seconds:
 // https://developers.circle.com/cctp/required-block-confirmations
 const SLOW_FINALITY: Record<number, string> = {
@@ -137,6 +142,17 @@ function parseAddress(input: string): Hex {
   if (!address) throw new HttpError(400, 'Invalid address. Use a 0x… or inj1… wallet address.')
   return address
 }
+
+// The ids an address shows up under in transfers: an EVM address, or a Solana wallet's key and its USDC account
+// (where USDC to it is minted), as hex.
+function addressIds(input: string): { address: string; ids: string[] } {
+  const value = input.trim()
+  const key = /^(0x|inj1)/i.test(value) ? undefined : publicKey(value)
+  if (key) return { address: value, ids: [hexKey(key), hexKey(usdcAccount(key))] }
+  const address = parseAddress(value)
+  return { address, ids: [address] }
+}
+const involves = (t: Transfer, ids: string[]) => ids.some((id) => same(t.sender, id) || same(t.recipient, id))
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{43,90}$/
 
@@ -183,14 +199,12 @@ const isAttested = (m?: IrisMessage): m is IrisMessage & { message: Hex } =>
 const word = (b: Hex) => (b.startsWith('0x000000000000000000000000') ? `0x${b.slice(26)}` : b).toLowerCase()
 
 // MessageV2 header (148 bytes) + BurnMessageV2 body: https://developers.circle.com/cctp/references/technical-guide
-// Only USDC moving to or from Injective decodes: on that side of the message, sender (outbound) or recipient (inbound) is the TokenMessenger.
+// A USDC burn is a message between TokenMessengers: the one on an EVM chain or Solana is the sender or the recipient.
+const isTokenMessenger = (b: Hex) => same(word(b), TOKEN_MESSENGER) || same(b, SOLANA_TOKEN_MESSENGER)
 function decodeBurn(message: Hex) {
   const field = (offset: number, length: number) => slice(message, offset, offset + length)
-  if (size(message) < 376) return
-  const sourceDomain = hexToNumber(field(4, 4))
+  if (size(message) < 376 || !(isTokenMessenger(field(44, 32)) || isTokenMessenger(field(76, 32)))) return
   const destinationDomain = hexToNumber(field(8, 4))
-  const local = sourceDomain === INJECTIVE_DOMAIN ? field(44, 32) : destinationDomain === INJECTIVE_DOMAIN ? field(76, 32) : undefined
-  if (!local || !same(word(local), TOKEN_MESSENGER)) return
   return {
     destinationDomain,
     destinationCaller: word(field(108, 32)),
@@ -223,6 +237,7 @@ async function locate(hash: Hex): Promise<{ domain: number; receipt?: Transactio
 
 // CCTP messages emitted on the source chain, in log order.
 async function sentMessages(domain: number, hash: Hex, receipt?: TransactionReceipt): Promise<Hex[]> {
+  if (domain === SOLANA_DOMAIN) return solanaMessages(hash)
   receipt ??= await chainOf(domain)?.client.getTransactionReceipt({ hash }).catch(() => undefined)
   if (!receipt) return []
   return parseEventLogs({ abi: [MessageSent], logs: receipt.logs })
@@ -232,6 +247,7 @@ async function sentMessages(domain: number, hash: Hex, receipt?: TransactionRece
 
 // Whether the destination chain already minted a message (undefined for chains we can't read).
 async function minted(domain: number, nonce: Hex) {
+  if (domain === SOLANA_DOMAIN) return mintedOnSolana(nonce)
   const chain = chainOf(domain)
   if (!chain) return
   const used = await chain.client.readContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'usedNonces', args: [nonce] }).catch(() => {
@@ -240,7 +256,37 @@ async function minted(domain: number, nonce: Hex) {
   return used !== 0n
 }
 
-// Resolves every transfer to or from Injective in a burn transaction, with its current status.
+// Solana marks a received message with an account at a PDA of its nonce. The first successful tx on it is the mint,
+// returned when the RPC still has it.
+async function mintedOnSolana(nonce: Hex): Promise<string | boolean> {
+  const pda = base58Encode(findProgramAddress([new TextEncoder().encode('used_nonce'), hexToBytes(nonce)], publicKey(solana.messageTransmitter)!))
+  const { value } = await solanaRpc<{ value: unknown }>('getAccountInfo', [pda, { encoding: 'base64', dataSlice: { offset: 0, length: 0 } }]).catch(() => {
+    throw new HttpError(502, `Could not reach ${solana.name}, try again.`)
+  })
+  if (value === null) return false
+  const signatures = await solanaRpc<{ signature: string; err: unknown }[]>('getSignaturesForAddress', [pda, { limit: 20 }]).catch(() => [])
+  return signatures.findLast((s) => !s.err)?.signature ?? true
+}
+
+// Before Circle attests a burn on Solana, its message is only in the event account the burn created (a new signer of the tx):
+// an 8-byte discriminator, the rent payer, created_at, then the message as a length-prefixed vector.
+async function solanaMessages(signature: string): Promise<Hex[]> {
+  const tx = await solanaRpc<{ transaction: { message: { accountKeys: string[]; header: { numRequiredSignatures: number } } } } | null>('getTransaction', [
+    signature,
+    { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+  ]).catch(() => null)
+  const { accountKeys, header } = tx?.transaction.message ?? { accountKeys: [], header: { numRequiredSignatures: 0 } }
+  const signers = accountKeys.slice(1, header.numRequiredSignatures)
+  if (!signers.length) return []
+  const { value } = await solanaRpc<{ value: ({ data: [string, string] } | null)[] }>('getMultipleAccounts', [signers, { encoding: 'base64' }]).catch(() => ({ value: [] }))
+  return value.flatMap((account) => {
+    const data = account && Buffer.from(account.data[0], 'base64')
+    if (!data || data.length < 52 || data.subarray(0, 8).toString('hex') !== '83648538a6e1973c') return []
+    return [toHex(data.subarray(52, 52 + data.readUInt32LE(48)))]
+  })
+}
+
+// Resolves every USDC transfer in a burn transaction, with its current status.
 async function inspect(input: string, domainHint?: number): Promise<Found[]> {
   const { hash, domain: hinted } = parseTx(input, domainHint)
   const { domain, receipt } = hinted === undefined ? await locate(hash) : { domain: hinted, receipt: undefined }
@@ -260,7 +306,7 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
     const m = messages[i]
     const raw = isAttested(m) ? m.message : (onchain ??= await sentMessages(domain, hash, receipt))[i]
     const burn = raw && decodeBurn(raw)
-    // Without the bytes (non-EVM sources before attestation) a transfer is assumed to be headed to Injective.
+    // Without the bytes (non-EVM sources other than Solana, before attestation) a transfer is assumed to be headed to Injective.
     if (raw ? !burn : domain === INJECTIVE_DOMAIN) continue
     const destination = burn?.destinationDomain ?? INJECTIVE_DOMAIN
     found.push({
@@ -287,7 +333,7 @@ async function inspect(input: string, domainHint?: number): Promise<Found[]> {
       },
     })
   }
-  if (!found.length) throw new HttpError(404, 'This transaction did not move USDC to or from Injective.')
+  if (!found.length) throw new HttpError(404, 'No USDC transfer found in this transaction.')
 
   await Promise.all(found.map(resolve))
   for (const { transfer: t } of found) if (t.nonce && t.destinationDomain === INJECTIVE_DOMAIN) linkMint(t.nonce, hash)
@@ -308,9 +354,10 @@ async function resolve({ transfer: t, burn, iris: m, message, attestation }: Fou
   t.note = undefined
   if (burn.feeExecuted) t.fee = formatUnits(burn.feeExecuted, 6)
   const mintTx = m?.destinationMintTxHash ?? (m?.forwardState === 'COMPLETE' ? m.forwardTxHash : null) ?? (inbound ? mintOf(t.nonce!)?.txHash : undefined)
-  if (mintTx || (await minted(t.destinationDomain, t.nonce!))) {
+  const mint = mintTx ?? (await minted(t.destinationDomain, t.nonce!))
+  if (mint) {
     t.status = 'redeemed'
-    t.redeemTx = mintTx ?? redeemTxOf(t.nonce!)
+    t.redeemTx = typeof mint === 'string' ? mint : redeemTxOf(t.nonce!)
     t.redeemTxUrl = t.redeemTx && txUrl(t.destinationDomain, t.redeemTx)
   } else if (!inbound && burn.forward && (!m?.forwardState || m.forwardState === 'PENDING')) {
     t.note = `Circle is delivering it to ${t.destinationChain}.`
@@ -338,12 +385,12 @@ export async function lookupTx(hash: string, domain?: number) {
 }
 
 export async function lookupAddress(input: string) {
-  const address = parseAddress(input)
-  const results = await Promise.all(unredeemedTxs(address).map((tx) => inspect(tx.txHash, tx.domain).catch(() => [])))
+  const { address, ids } = addressIds(input)
+  const results = await Promise.all(unredeemedTxs(ids).map((tx) => inspect(tx.txHash, tx.domain).catch(() => [])))
   const transfers = results
     .flat()
     .map((f) => f.transfer)
-    .filter((t) => t.status !== 'redeemed' && (same(t.recipient, address) || same(t.sender, address)))
+    .filter((t) => t.status !== 'redeemed' && involves(t, ids))
   return { address, transfers }
 }
 
@@ -351,13 +398,13 @@ const HISTORY_PAGE = 20
 
 // Everything indexed that moved USDC from or to an address, newest first, a page at a time.
 export async function history(input: string, offset = 0) {
-  const address = parseAddress(input)
-  let rows = historyRows(address, HISTORY_PAGE + 1, offset)
+  const { address, ids } = addressIds(input)
+  let rows = historyRows(ids, HISTORY_PAGE + 1, offset)
   // Linking a mint to its burn tx also drops that tx from the page, where it would show up twice.
   const unlinked = rows.filter((r) => r.kind === 'mint' && !r.txHash)
   if (unlinked.length) {
     await Promise.all(unlinked.map((r) => sourceTxOf(r.domain, r.nonce!).then((tx) => tx && linkMint(r.nonce!, tx), () => {})))
-    rows = historyRows(address, HISTORY_PAGE + 1, offset)
+    rows = historyRows(ids, HISTORY_PAGE + 1, offset)
   }
   const page = rows.slice(0, HISTORY_PAGE)
   const results = await Promise.allSettled(
@@ -366,9 +413,7 @@ export async function history(input: string, offset = 0) {
   // One tx failing shouldn't hide the rest, but if Circle or the RPCs are down for all of them, say so.
   const failed = results.filter((r) => r.status === 'rejected')
   if (page.length && failed.length === page.length) throw failed[0]!.reason
-  const transfers = results
-    .flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
-    .filter((t) => same(t.recipient, address) || same(t.sender, address))
+  const transfers = results.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])).filter((t) => involves(t, ids))
   return { address, transfers, next: rows.length > HISTORY_PAGE ? offset + HISTORY_PAGE : null }
 }
 
@@ -405,7 +450,7 @@ export async function redeem(hash: string, domain?: number) {
   if (!relayer) throw new HttpError(503, 'Redeeming is disabled on this server.')
   const found = await inspect(hash, domain)
   const inbound = found.filter((f) => f.transfer.destinationDomain === INJECTIVE_DOMAIN)
-  if (!inbound.length) throw new HttpError(409, 'Transfers from Injective are minted on the destination chain, not by this service.')
+  if (!inbound.length) throw new HttpError(409, 'Only transfers to Injective are minted by this service, others are claimed on their destination chain.')
   const ready = inbound.filter((f) => f.transfer.status === 'ready')
   const pending = inbound.filter((f) => f.transfer.status === 'pending')
   if (!ready.length && !pending.length) {
@@ -422,6 +467,7 @@ export async function redeem(hash: string, domain?: number) {
 }
 
 export async function balance(domain: number, address: string) {
+  if (domain === SOLANA_DOMAIN) return { balance: await solanaBalance(address) }
   const chain = chainOf(domain)
   if (!chain) throw new HttpError(400, `Unsupported chain (domain ${domain}).`)
   const owner = parseAddress(address)
@@ -431,34 +477,44 @@ export async function balance(domain: number, address: string) {
   return { balance: formatUnits(units, 6) }
 }
 
+async function solanaBalance(address: string) {
+  const owner = publicKey(address.trim())
+  if (!owner) throw new HttpError(400, 'Invalid Solana address.')
+  const result = await solanaRpc<{ value: { amount: string } }>('getTokenAccountBalance', [base58Encode(usdcAccount(owner))]).catch((err: Error) => {
+    if (/could not find account/i.test(err.message)) return { value: { amount: '0' } } // no USDC account yet
+    throw new HttpError(502, `Could not reach ${solana.name}, try again.`)
+  })
+  return formatUnits(BigInt(result.value.amount), 6)
+}
+
 // ---- Fees -----------------------------------------------------------------------------------------
 
 export type Fees = { fastBps: number | null; forwardFee: string | null; standardTime: string | null }
 const feeCache = new Map<string, { expires: number; fees: Promise<Fees> }>()
 
 // fastBps: Fast Transfer fee in bps of the amount, null when the source only has standard transfers.
-// forwardFee: USDC that Circle's Forwarding Service takes to mint a transfer from Injective on the destination,
-// null when it can't deliver there (the recipient then claims it on the destination chain).
+// forwardFee: USDC that Circle's Forwarding Service takes to mint the transfer on the destination, null when it can't
+// deliver there (to Injective our relayer mints instead, elsewhere the recipient claims it on the destination chain).
 // standardTime: average wait for a standard transfer, null when it's under a minute.
-export async function fees(from: number, to: number): Promise<Fees> {
-  if (!domainName(from) || !domainName(to) || from === to || (from !== INJECTIVE_DOMAIN && to !== INJECTIVE_DOMAIN))
-    throw new HttpError(400, 'Only routes to or from Injective are supported.')
-  const key = `${from}:${to}`
+// setup: to Solana, the forwardFee also covers creating the recipient's USDC account.
+export async function fees(from: number, to: number, setup = false): Promise<Fees> {
+  if (!bridgeable(from) || !bridgeable(to) || from === to) throw new HttpError(400, 'Unsupported route.')
+  const key = `${from}:${to}:${setup}`
   let entry = feeCache.get(key)
   if (!entry || entry.expires < Date.now()) {
-    entry = { expires: Date.now() + 60_000, fees: loadFees(from, to) }
+    entry = { expires: Date.now() + 60_000, fees: loadFees(from, to, setup && to === SOLANA_DOMAIN) }
     feeCache.set(key, entry)
     entry.fees.catch(() => feeCache.delete(key))
   }
   return entry.fees
 }
 
-async function loadFees(from: number, to: number): Promise<Fees> {
+async function loadFees(from: number, to: number, setup: boolean): Promise<Fees> {
   const path = `/v2/burn/USDC/fees/${from}/${to}`
-  const outbound = from === INJECTIVE_DOMAIN
-  let res = await iris(outbound ? `${path}?forward=true` : path)
-  const forwarding = outbound && res.ok // Circle answers 400 for destinations it can't forward to
-  if (outbound && !res.ok) res = await iris(path)
+  const tryForward = to !== INJECTIVE_DOMAIN // Circle can't forward to Injective
+  let res = await iris(tryForward ? `${path}?forward=true${setup ? '&includeRecipientSetup=true' : ''}` : path)
+  const forwarding = tryForward && res.ok // Circle answers 400 for destinations it can't forward to
+  if (tryForward && !res.ok) res = await iris(path)
   if (!res.ok) throw new HttpError(502, `Circle fee API error (${res.status}).`)
   const list = (await res.json()) as { finalityThreshold: number; minimumFee: number; forwardFee?: { med: number } }[]
   const fast = list.find((f) => f.finalityThreshold === 1000)?.minimumFee ?? 0
@@ -476,7 +532,7 @@ const inflight = new Map<string, Promise<Hex>>()
 let queue = Promise.resolve()
 
 // A single relayer key has a single nonce sequence, so transactions go out one at a time.
-function serial<T>(task: () => Promise<T>): Promise<T> {
+export function serial<T>(task: () => Promise<T>): Promise<T> {
   const run = queue.then(task)
   queue = run.then(() => {}, () => {})
   return run
@@ -544,7 +600,7 @@ async function refreshIfExpired(f: Found): Promise<Found> {
   throw new Error('the attestation expired and Circle has not re-signed it yet, try again in a few minutes')
 }
 
-function describe(err: unknown) {
+export function describe(err: unknown) {
   if (!(err instanceof BaseError)) return err instanceof Error ? err.message : String(err)
   if (err.walk((e) => e instanceof InsufficientFundsError)) return 'the relayer is out of gas funds, please contact the operator'
   const revert = err.walk((e) => e instanceof ContractFunctionRevertedError)

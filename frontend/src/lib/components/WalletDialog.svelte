@@ -2,6 +2,7 @@
   import WalletIcon from '@lucide/svelte/icons/wallet'
   import XIcon from '@lucide/svelte/icons/x'
   import { Spinner } from '$lib/components/ui/spinner'
+  import { connectSolana, solanaWallet } from '$lib/solana-wallet.svelte'
   import { connect, wallet, walletError } from '$lib/wallet.svelte'
 
   let dialog = $state<HTMLDialogElement>()
@@ -16,11 +17,15 @@
     } else if (!wallet.picking && dialog.open) dialog.close()
   })
 
+  // EVM wallets, or Solana ones when connecting for Solana.
+  const solana = $derived(wallet.picking === 'solana')
+  const options = $derived(solana ? solanaWallet.available : wallet.available)
+
   async function pick(id: string) {
     connecting = id
     error = ''
     try {
-      await connect(id)
+      await (solana ? connectSolana(id) : connect(id))
     } catch (err) {
       error = walletError(err) ?? ''
     } finally {
@@ -37,13 +42,13 @@
   onclick={(event) => event.target === dialog && dialog?.close()}
 >
   <div class="flex items-center justify-between px-4 pt-4 pb-3">
-    <h2 id="wallet-title" class="text-sm font-semibold tracking-tight">Connect a wallet</h2>
+    <h2 id="wallet-title" class="text-sm font-semibold tracking-tight">Connect a {solana ? 'Solana ' : ''}wallet</h2>
     <button class="text-muted-foreground hover:text-foreground -mr-1 rounded-md p-1" aria-label="Close" onclick={() => dialog?.close()}>
       <XIcon class="size-4" />
     </button>
   </div>
   <div class="flex flex-col gap-1 px-2 pb-2">
-    {#each wallet.available as option (option.id)}
+    {#each options as option (option.id)}
       <button
         class="hover:bg-muted flex h-11 items-center gap-3 rounded-md px-2.5 text-left text-[13px] font-medium transition-colors disabled:opacity-60"
         disabled={!!connecting}
@@ -59,7 +64,7 @@
       </button>
     {:else}
       <p class="text-muted-foreground px-2.5 pb-3 text-xs leading-relaxed">
-        No wallet found. Install a browser wallet like MetaMask or Rabby, then reload this page.
+        No wallet found. Install a browser wallet like {solana ? 'Phantom or Solflare' : 'MetaMask or Rabby'}, then reload this page.
       </p>
     {/each}
     {#if error}

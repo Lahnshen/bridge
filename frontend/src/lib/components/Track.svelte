@@ -2,37 +2,41 @@
   import ArrowRightIcon from '@lucide/svelte/icons/arrow-right'
   import SearchIcon from '@lucide/svelte/icons/search'
   import { Spinner } from '$lib/components/ui/spinner'
-  import { getAddressTransfers, getTxTransfers, isAddress, isTxHash, type Transfer } from '$lib/api'
+  import { getHistory, getTxTransfers, isAddress, isTxHash, type Transfer } from '$lib/api'
   import { linkedQuery } from '$lib/app.svelte'
   import RecentList from './RecentList.svelte'
   import TransferCard from './TransferCard.svelte'
 
+  // A tx hash shows its transfers, an address every transfer from or to it (finished ones too), a page at a time.
   let query = $state(linkedQuery)
   let searched = $state('')
   let results = $state<Transfer[]>()
+  let next = $state<number | null>(null) // offset of the address's next page
   let loading = $state(false)
+  let loadingMore = $state(false)
   let error = $state('')
   let latest = 0
 
-  async function search(q = query.trim(), quiet = false) {
+  const key = (t: Transfer) => `${t.sourceDomain}:${t.txHash}:${t.nonce ?? ''}`
+
+  async function search(q = query.trim()) {
     if (!isAddress(q) && !isTxHash(q)) {
-      error = 'Enter a 0x… or inj1… address, or a transaction hash.'
+      error = 'Enter a 0x…, inj1… or Solana address, or a transaction hash.'
       results = undefined
       return
     }
     const id = ++latest
-    if (!quiet) {
-      loading = true
-      error = ''
-    }
+    loading = true
+    error = ''
     try {
-      const { transfers } = await (isTxHash(q) ? getTxTransfers(q) : getAddressTransfers(q))
+      const page = isTxHash(q) ? { ...(await getTxTransfers(q)), next: null } : await getHistory(q)
       if (id !== latest) return
-      results = transfers
+      results = page.transfers
+      next = page.next
       searched = q
-      if (!quiet) history.replaceState(null, '', `?q=${encodeURIComponent(q)}`)
+      history.replaceState(null, '', `?q=${encodeURIComponent(q)}`)
     } catch (err) {
-      if (id === latest && !quiet) {
+      if (id === latest) {
         error = (err as Error).message
         results = undefined
       }
@@ -41,23 +45,52 @@
     }
   }
 
+  async function loadMore() {
+    const id = latest
+    loadingMore = true
+    error = ''
+    try {
+      const page = await getHistory(searched, next!)
+      if (id !== latest) return
+      const seen = new Set(results!.map(key))
+      results = [...results!, ...page.transfers.filter((t) => !seen.has(key(t)))]
+      next = page.next
+    } catch (err) {
+      if (id === latest) error = (err as Error).message
+    } finally {
+      loadingMore = false
+    }
+  }
+
   if (linkedQuery) void search(linkedQuery)
 
   // Keep transfers in flight fresh.
   $effect(() => {
     if (!results?.some((t) => t.status === 'pending')) return
-    const timer = setInterval(() => search(searched, true), 30_000)
+    const timer = setInterval(refreshPending, 30_000)
     return () => clearInterval(timer)
   })
 
+  async function refreshPending() {
+    const id = latest
+    const txs = new Map(results!.filter((t) => t.status === 'pending' && t.txHash).map((t) => [t.txHash, t.sourceDomain]))
+    for (const [hash, domain] of txs) {
+      const fresh = await getTxTransfers(hash, domain).catch(() => undefined)
+      if (id !== latest) return
+      for (const transfer of fresh?.transfers ?? []) merge(transfer)
+    }
+  }
+
+  const merge = (transfer: Transfer) => (results = results?.map((t) => (key(t) === key(transfer) ? { ...transfer, time: transfer.time ?? t.time } : t)))
+
   function update(transfer: Transfer) {
     latest++ // a refresh started before this is stale
-    results = results?.map((t) => (t.txHash === transfer.txHash && t.nonce === transfer.nonce ? transfer : t))
+    merge(transfer)
   }
 </script>
 
 <h1 class="font-serif text-[26px] leading-tight tracking-tight">Track a transfer</h1>
-<p class="text-muted-foreground mt-1">Find any USDC transfer to or from Injective.</p>
+<p class="text-muted-foreground mt-1">Find any USDC transfer by wallet address or transaction hash.</p>
 
 <form
   class="bg-card focus-within:border-ring focus-within:ring-ring/30 mt-6 flex h-12 items-center gap-2.5 rounded-lg border pr-1.5 pl-4 shadow-xs transition-shadow focus-within:ring-3"
@@ -91,11 +124,20 @@
 
 {#if results}
   <div class="mt-5 flex flex-col gap-3">
-    {#each results as transfer, i (`${transfer.txHash}:${transfer.nonce ?? i}`)}
+    {#each results as transfer (key(transfer))}
       <TransferCard item={transfer} onupdate={update} />
     {:else}
-      <p class="text-muted-foreground rounded-lg border border-dashed px-4 py-6 text-center text-xs">No pending transfers for this address.</p>
+      <p class="text-muted-foreground rounded-lg border border-dashed px-4 py-6 text-center text-xs">No transfers found for this address.</p>
     {/each}
+    {#if next !== null}
+      <button
+        class="text-muted-foreground hover:text-foreground bg-card flex h-10 items-center justify-center gap-2 rounded-lg border text-xs shadow-xs transition-colors disabled:pointer-events-none"
+        disabled={loadingMore}
+        onclick={loadMore}
+      >
+        {#if loadingMore}<Spinner class="size-3.5" />Loading…{:else}Load more{/if}
+      </button>
+    {/if}
   </div>
 {:else if !error}
   <RecentList class="mt-8 md:hidden" />

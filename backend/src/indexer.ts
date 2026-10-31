@@ -2,8 +2,9 @@ import { Database } from 'bun:sqlite'
 import { BaseError, hexToBigInt, hexToNumber, parseAbiItem, parseEventLogs, size, slice, type Hex, type TransactionReceipt } from 'viem'
 import { chains, dbPath, historyFromBlock, INJECTIVE_DOMAIN, lookbackHours, MESSAGE_TRANSMITTER, pollMs, TOKEN_MESSENGER, type EvmChain } from './config'
 
-// Watches every EVM chain for burns to Injective, and Injective for burns leaving it and mints arriving, so transfers can be
-// looked up by wallet address. Injective sees both sides of every transfer, so it's indexed all the way back for full history.
+// Watches every EVM chain for burns, and Injective for mints arriving too, so transfers can be looked up by wallet address.
+// Injective sees both sides of every transfer to or from it, so it's indexed all the way back for full history. Burns on
+// other routes are only kept for a while (see prune).
 
 const DepositForBurn = parseAbiItem(
   'event DepositForBurn(address indexed burnToken, uint256 amount, address indexed depositor, bytes32 mintRecipient, uint32 destinationDomain, bytes32 destinationTokenMessenger, bytes32 destinationCaller, uint256 maxFee, uint32 indexed minFinalityThreshold, bytes hookData)',
@@ -14,7 +15,7 @@ const MessageReceived = parseAbiItem(
 type Burn = { transactionHash: Hex; logIndex: number; blockNumber: bigint; args: { depositor: Hex; mintRecipient: Hex; destinationDomain: number } }
 type Mint = { transactionHash: Hex; blockNumber: bigint; args: { sourceDomain: number; nonce: Hex; messageBody: Hex } }
 
-const db = new Database(dbPath, { create: true })
+export const db = new Database(dbPath, { create: true })
 db.run('PRAGMA journal_mode = WAL')
 db.run(`CREATE TABLE IF NOT EXISTS burns (
   domain INTEGER NOT NULL,
@@ -38,6 +39,8 @@ db.run('CREATE TABLE IF NOT EXISTS done (domain INTEGER NOT NULL, tx_hash TEXT N
 const columns = db.query<{ name: string }, []>('PRAGMA table_info(burns)').all().map((c) => c.name)
 if (!columns.includes('block')) db.run('ALTER TABLE burns ADD COLUMN block INTEGER')
 if (!columns.includes('time')) db.run('ALTER TABLE burns ADD COLUMN time INTEGER')
+// And later the destination domain, once burns between other chains were indexed too (older rows all touch Injective).
+if (!columns.includes('destination')) db.run('ALTER TABLE burns ADD COLUMN destination INTEGER')
 db.run('CREATE INDEX IF NOT EXISTS burns_time ON burns (time)')
 // USDC minted on Injective. source_tx (the burn) isn't in the event, so it's looked up from Circle when needed.
 db.run(`CREATE TABLE IF NOT EXISTS mints (
@@ -57,7 +60,7 @@ db.run('CREATE INDEX IF NOT EXISTS mints_source_tx ON mints (source_tx)')
 // Lowest block indexed so far, for chains whose history is filled in backwards.
 db.run('CREATE TABLE IF NOT EXISTS backfill (domain INTEGER PRIMARY KEY, block INTEGER NOT NULL)')
 
-const insertBurn = db.query('INSERT OR IGNORE INTO burns (domain, tx_hash, log_index, sender, recipient, block, time) VALUES (?, ?, ?, ?, ?, ?, ?)')
+const insertBurn = db.query('INSERT OR IGNORE INTO burns (domain, tx_hash, log_index, sender, recipient, destination, block, time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
 const insertMint = db.query('INSERT OR IGNORE INTO mints (nonce, source_domain, sender, recipient, amount, fee, tx_hash, time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
 const getCursor = db.query<{ block: number }, [number]>('SELECT block FROM cursors WHERE domain = ?')
 const setCursor = db.query('INSERT OR REPLACE INTO cursors (domain, block) VALUES (?, ?)')
@@ -65,15 +68,13 @@ const getBackfill = db.query<{ block: number }, [number]>('SELECT block FROM bac
 const setBackfill = db.query('INSERT OR REPLACE INTO backfill (domain, block) VALUES (?, ?)')
 
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
-const touchesInjective = (domain: number, burn: Burn) => domain === INJECTIVE_DOMAIN || burn.args.destinationDomain === INJECTIVE_DOMAIN
 // bytes32 → 0x address when it holds an EVM address (Solana & co. keep all 32 bytes)
 const word = (b: Hex) => (b.startsWith('0x000000000000000000000000') ? `0x${b.slice(26)}` : b).toLowerCase()
 
 function saveBurns(domain: number, burns: Burn[], times?: Map<bigint, number>) {
-  for (const burn of burns) {
-    if (!touchesInjective(domain, burn)) continue
-    const { transactionHash, logIndex, blockNumber, args } = burn
-    insertBurn.run(domain, transactionHash.toLowerCase(), logIndex, args.depositor.toLowerCase(), word(args.mintRecipient), Number(blockNumber), times?.get(blockNumber) ?? null)
+  for (const { transactionHash, logIndex, blockNumber, args } of burns) {
+    const time = times?.get(blockNumber) ?? null
+    insertBurn.run(domain, transactionHash.toLowerCase(), logIndex, args.depositor.toLowerCase(), word(args.mintRecipient), args.destinationDomain, Number(blockNumber), time)
   }
 }
 
@@ -94,29 +95,31 @@ export const indexReceipt = (domain: number, receipt: TransactionReceipt) =>
 export const domainOf = (txHash: string) =>
   db.query<{ domain: number }, [string]>('SELECT domain FROM burns WHERE tx_hash = ? LIMIT 1').get(txHash.toLowerCase())?.domain
 
-export const unredeemedTxs = (address: string) =>
+// `ids` are the one or two forms an address is stored under (see addressIds in cctp.ts).
+export const unredeemedTxs = (ids: string[]) =>
   db
-    .query<{ domain: number; txHash: string }, [string]>(
-      `SELECT domain, tx_hash AS txHash FROM burns WHERE (recipient = ?1 OR sender = ?1) AND redeemed = 0
+    .query<{ domain: number; txHash: string }, [string, string]>(
+      `SELECT domain, tx_hash AS txHash FROM burns WHERE (recipient IN (?1, ?2) OR sender IN (?1, ?2)) AND redeemed = 0
        GROUP BY domain, tx_hash ORDER BY MAX(rowid) DESC LIMIT 25`,
     )
-    .all(address)
+    .all(ids[0]!, ids[1] ?? ids[0]!)
 
 // A page of everything that moved USDC from or to an address, newest first: mints on Injective, and burn txs (from Injective,
 // or to it and not minted yet). Burns without a timestamp yet are brand new.
 export type HistoryRow = { kind: 'mint' | 'burn'; domain: number; txHash: string | null; nonce: string | null }
-export const historyRows = (address: string, limit: number, offset: number) =>
+export const historyRows = (ids: string[], limit: number, offset: number) =>
   db
-    .query<HistoryRow, [string, number, number]>(
+    .query<HistoryRow, [string, string, number, number]>(
       `SELECT kind, domain, txHash, nonce FROM (
-         SELECT 'mint' AS kind, source_domain AS domain, source_tx AS txHash, nonce, time, rowid AS id FROM mints WHERE sender = ?1 OR recipient = ?1
+         SELECT 'mint' AS kind, source_domain AS domain, source_tx AS txHash, nonce, time, rowid AS id FROM mints
+         WHERE sender IN (?1, ?2) OR recipient IN (?1, ?2)
          UNION ALL
-         SELECT 'burn', domain, tx_hash, NULL, MAX(time), MAX(rowid) FROM burns b WHERE (sender = ?1 OR recipient = ?1)
+         SELECT 'burn', domain, tx_hash, NULL, MAX(time), MAX(rowid) FROM burns b WHERE (sender IN (?1, ?2) OR recipient IN (?1, ?2))
            AND (domain = ${INJECTIVE_DOMAIN} OR NOT EXISTS (SELECT 1 FROM mints m WHERE m.source_tx = b.tx_hash))
          GROUP BY domain, tx_hash
-       ) ORDER BY COALESCE(time, unixepoch()) DESC, id DESC LIMIT ?2 OFFSET ?3`,
+       ) ORDER BY COALESCE(time, unixepoch()) DESC, id DESC LIMIT ?3 OFFSET ?4`,
     )
-    .all(address, limit, offset)
+    .all(ids[0]!, ids[1] ?? ids[0]!, limit, offset)
 
 export type MintRow = { nonce: Hex; sourceDomain: number; sourceTx: string | null; sender: string; recipient: string; amount: string; fee: string; txHash: Hex; time: number }
 export const mintOf = (nonce: string) =>
@@ -162,6 +165,13 @@ export function startIndexer() {
     void fillTimes(chain)
   }
   if (historyFromBlock !== undefined) void backfill(chains.find((chain) => chain.domain === INJECTIVE_DOMAIN)!, historyFromBlock)
+  prune()
+  setInterval(prune, 3_600_000).unref()
+}
+
+// Burns between two other chains are kept for 30 days, enough to look up recent ones by address without the index growing forever.
+function prune() {
+  db.query('DELETE FROM burns WHERE domain != ?1 AND destination != ?1 AND time < ?2').run(INJECTIVE_DOMAIN, Math.floor(Date.now() / 1000) - 30 * 86_400)
 }
 
 // Looks up the block time of burns indexed without one (before times were stored, or from a lookup's receipt), newest first.
@@ -259,7 +269,7 @@ async function indexRange({ domain, client }: EvmChain, from: number, to: number
   })
   const burns = logs.filter((l) => l.eventName === 'DepositForBurn' && same(l.address, TOKEN_MESSENGER)) as Burn[]
   const mints = logs.filter((l) => l.eventName === 'MessageReceived' && same(l.address, MESSAGE_TRANSMITTER)) as Mint[]
-  const times = await blockTimes(client, [...burns.filter((b) => touchesInjective(domain, b)), ...mints].map((l) => l.blockNumber))
+  const times = await blockTimes(client, [...burns, ...mints].map((l) => l.blockNumber))
   db.transaction(() => {
     saveBurns(domain, burns, times)
     saveMints(mints, times)

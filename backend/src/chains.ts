@@ -45,6 +45,8 @@ export type ChainInfo = {
   ids: Partial<Record<Source, string | number>> // each bridge's own id for the chain
   natives: Partial<Record<Source, Asset>> // each bridge's own address for the gas token
   tokens?: Source // whose token list the chain uses
+  cosmosSide?: string // the id of the chain's Cosmos side, when the two are one chain to the user (see ONE_CHAIN)
+  sideOf?: string // on that Cosmos side: the chain it belongs to, listed in its place
 }
 
 export const NATIVE = '0x0000000000000000000000000000000000000000'
@@ -351,10 +353,26 @@ function finish(map: Map<string, ChainInfo>): ChainInfo[] {
 
   // The CCTP chains in their order, then the rest by how many bridges reach them.
   const reach = (c: ChainInfo) => Object.keys(c.ids).length
-  return list.sort((a, b) => {
-    if (a.domain !== undefined || b.domain !== undefined) return a.domain === undefined ? 1 : b.domain === undefined ? -1 : 0
-    return reach(b) - reach(a) || a.name.localeCompare(b.name)
-  })
+  return joinSides(
+    list.sort((a, b) => {
+      if (a.domain !== undefined || b.domain !== undefined) return a.domain === undefined ? 1 : b.domain === undefined ? -1 : 0
+      return reach(b) - reach(a) || a.name.localeCompare(b.name)
+    }),
+  )
+}
+
+// EVM chains whose Cosmos side is the same chain to the user, listed as one. On Injective the tokens are the same on both
+// sides (each bank denom has an ERC20 twin: the MultiVM Token Standard) and so is the account (inj1… is the 0x… address).
+// Bridges still see two chains: Skip reaches the Cosmos side as injective-1, the others the EVM side.
+const ONE_CHAIN: Record<number, string> = { 1776: 'injective-1' }
+
+function joinSides(list: ChainInfo[]) {
+  for (const c of list) {
+    const cosmosId = c.kind === 'evm' ? ONE_CHAIN[c.chainId!] : undefined
+    const side = cosmosId && list.find((s) => s.cosmosId === cosmosId)
+    if (side) [c.cosmosSide, side.sideOf] = [side.id, c.id]
+  }
+  return list
 }
 
 // ---- The registry ------------------------------------------------------------------------------------
@@ -428,10 +446,13 @@ const FORMATS: Partial<Record<Kind, RegExp>> = {
   stellar: /^G[A-Z2-7]{55}$/,
 }
 
-// Whether an address can receive (or send) on the chain. Solana-style keys are 32 bytes of base58.
-export function validAddress(chain: ChainInfo, address: string) {
+// Whether an address can receive (or send) on the chain. Solana-style keys are 32 bytes of base58. A chain with a Cosmos
+// side takes that side's form too (Injective's inj1…).
+export function validAddress(chain: ChainInfo, address: string): boolean {
   if (chain.kind === 'solana' || chain.kind === 'eclipse') return BASE58.test(address) && address.length >= 32 && address.length <= 44
   if (chain.kind === 'cosmos') return bech32Decode(address)?.prefix === chain.bech32
+  const side = chain.cosmosSide ? byId.get(chain.cosmosSide) : undefined
+  if (side && validAddress(side, address)) return true
   return !!FORMATS[chain.kind]?.test(address)
 }
 
@@ -464,12 +485,23 @@ export function sameAccount(address: string, from: ChainInfo, to: ChainInfo): st
   const evmLike = (c: ChainInfo) => c.kind === 'evm' || c.kind === 'hypercore'
   if (evmLike(from) && evmLike(to)) return address
   if (from.kind === 'solana' && to.kind === 'solana') return address
+  if (from.kind === 'cosmos' && from.slip44 === 60 && evmLike(to)) {
+    const decoded = bech32Decode(address)
+    return decoded?.bytes.length === 20 ? `0x${Buffer.from(decoded.bytes).toString('hex')}` : undefined
+  }
   if (to.kind !== 'cosmos') return
   if (from.kind === 'cosmos' && from.slip44 === to.slip44) {
     const decoded = bech32Decode(address)
     return decoded && bech32Encode(to.bech32!, decoded.bytes)
   }
   if (evmLike(from) && to.slip44 === 60 && /^0x[0-9a-fA-F]{40}$/.test(address)) return bech32Encode(to.bech32!, Uint8Array.from(Buffer.from(address.slice(2), 'hex')))
+}
+
+// An address of a chain with a Cosmos side, in the form one of its sides takes: inj1… on the Cosmos side, 0x… on the EVM one.
+export function addressOnSide(address: string, side: ChainInfo) {
+  const bytes = /^0x[0-9a-fA-F]{40}$/.test(address) ? Uint8Array.from(Buffer.from(address.slice(2), 'hex')) : bech32Decode(address)?.bytes
+  if (bytes?.length !== 20) return address
+  return side.kind === 'cosmos' ? bech32Encode(side.bech32!, bytes) : `0x${Buffer.from(bytes).toString('hex')}`
 }
 
 // ---- EVM clients -------------------------------------------------------------------------------------

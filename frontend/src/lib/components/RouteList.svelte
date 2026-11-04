@@ -1,6 +1,7 @@
 <script lang="ts" module>
   // A way to bridge: Circle CCTP or one of the other bridges' quotes, in destination token units.
-  export type RouteOption = { id: string; name: string; via?: string; out: bigint; min: bigint; seconds: number; time: string; fee: string }
+  // id: the bridge's, or with the side for one of Injective's two (see routeKey in Bridge). tag: a note shown by the name.
+  export type RouteOption = { id: string; provider: string; name: string; tag?: string; via?: string; out: bigint; min: bigint; seconds: number; time: string; fee: string }
 </script>
 
 <script lang="ts">
@@ -36,11 +37,12 @@
         expanded = false
       }}
     >
-      <img src={providerLogo(option.id)} alt="" class="size-6 shrink-0 rounded-full object-cover" />
+      <img src={providerLogo(option.provider)} alt="" class="size-6 shrink-0 rounded-full object-cover" />
       <span class="min-w-0 flex-1">
         <span class="flex items-center gap-1.5 text-[13px] font-medium">
           {option.name}
           {#if option.id === options[0]!.id && options.length > 1}<span class="bg-success/15 text-success rounded-sm px-1 py-px text-[10px] leading-none">Best</span>{/if}
+          {#if option.tag}<span class="bg-muted text-muted-foreground rounded-sm px-1 py-px text-[10px] leading-none">{option.tag}</span>{/if}
         </span>
         <span class="text-muted-foreground block truncate text-[11px]">{option.via ? `via ${option.via} · ` : ''}{option.time} · {option.fee}</span>
       </span>

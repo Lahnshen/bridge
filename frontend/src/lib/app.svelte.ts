@@ -19,8 +19,15 @@ export const app = $state({
 })
 
 export const chainOf = (domain?: number) => (domain === undefined ? undefined : app.chains.find((chain) => chain.domain === domain))
-// By id, as in links (/bridge?from=arbitrum&to=injective) and the logo files.
-export const chainById = (id?: string | null) => (id ? app.chains.find((chain) => chain.id === id.toLowerCase()) : undefined)
+// By id, as in links (/bridge?from=arbitrum&to=injective) and the logo files. Injective's Cosmos side has its own, for
+// the transfers that start or end there (see listedChain).
+export function chainById(id?: string | null): Chain | undefined {
+  const key = id?.toLowerCase()
+  if (!key) return
+  return app.chains.find((chain) => chain.id === key) ?? app.chains.flatMap((c) => (c.kind === 'evm' && c.cosmos?.id === key ? [c.cosmos] : []))[0]
+}
+// The chain the picker lists: a Cosmos side's chain for the side itself (old links to injective-cosmos).
+export const listedChain = (chain?: Chain) => (chain && app.chains.find((c) => c.kind === 'evm' && c.cosmos?.id === chain.id)) ?? chain
 // A transfer's chain: by id, or by CCTP domain for transfers saved before chains had ids.
 export const chainFor = (id?: string, domain?: number) => chainById(id) ?? chainOf(domain)
 export const injective = () => chainOf(INJECTIVE) as EvmChain & { domain: number; usdc: `0x${string}` }
@@ -43,7 +50,7 @@ export async function loadConfig() {
     app.config = config
     if (app.view === 'swap' && !config.swap) navigate('bridge', undefined, true)
     void trackRecent(config.autoRedeem)
-    restoreCosmos(app.chains)
+    restoreCosmos(app.chains.flatMap((c) => (c.kind === 'evm' && c.cosmos ? [c, c.cosmos] : [c])))
   } catch (err) {
     app.error = (err as Error).message
   }

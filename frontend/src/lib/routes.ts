@@ -77,7 +77,8 @@ export async function runSteps(chain: Chain, steps: Step[], progress: (label: st
     }
     if (step.kind === 'cosmos') {
       // The server builds the transaction (and simulates it for the gas), the wallet signs it, the server broadcasts it.
-      const cosmos = chain as CosmosChain
+      // From Injective that's on its Cosmos side.
+      const cosmos = chain.kind === 'evm' && chain.cosmos ? chain.cosmos : (chain as CosmosChain)
       if (step.chainId !== cosmos.cosmosId) throw new Error('This route sends from another chain, pick it again.')
       progress('Preparing the transaction…')
       const key = await cosmosKey(cosmos)

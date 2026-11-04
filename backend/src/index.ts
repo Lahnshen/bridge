@@ -60,11 +60,23 @@ const chainRef = t.Union([t.String({ maxLength: 64 }), domainId]) // a chain id,
 
 // Every chain the bridges reach, for the chain picker. send: the app can send from it (EVM, Solana, and Cosmos chains
 // with a REST endpoint); via: the bridges that reach it. rpc and rest are public, for wallets that have to add the chain.
+// A chain's Cosmos side (Injective's) comes inside it, as cosmos: the app signs and confirms that side's transactions there.
 let networks: { from: ChainInfo[]; list: unknown[] } | undefined
 function networkList() {
   const chains = allChains()
   if (networks?.from === chains) return networks.list
-  const list = chains.map((c) => ({
+  const list = chains.flatMap((c) => {
+    if (c.sideOf) return []
+    const side = c.cosmosSide ? chainById(c.cosmosSide) : undefined
+    if (!side) return [networkEntry(c)]
+    const via = [...new Set([...providersOn(c), ...providersOn(side)])]
+    return [{ ...networkEntry(c), via, cosmos: { ...networkEntry(side), name: c.name, logo: c.logo } }]
+  })
+  networks = { from: chains, list }
+  return list
+}
+function networkEntry(c: ChainInfo) {
+  return {
     id: c.id,
     name: c.name,
     kind: c.kind,
@@ -85,9 +97,7 @@ function networkList() {
       canSend(c) &&
       (c.kind !== 'cosmos' || (!!c.rest && !!c.gas && providersOn(c).includes('skip'))) &&
       (c.kind !== 'hypercore' || providersOn(c).includes('relay')),
-  }))
-  networks = { from: chains, list }
-  return list
+  }
 }
 let chainsBody: { list: unknown[]; text: string; gzip: Uint8Array<ArrayBuffer> } | undefined
 function chainsJson() {
@@ -256,6 +266,6 @@ startIndexer()
 void autoRedeem()
 void resumeSwaps()
 // The token lists most people open, loaded ahead: the CCTP chains', then the main Cosmos chains'.
-void ready.then(() => warmTokens([...allChains().filter((c) => c.domain !== undefined), ...['injective-cosmos', 'osmosis', 'cosmoshub', 'noble'].flatMap((id) => chainById(id) ?? [])]))
+void ready.then(() => warmTokens([...allChains().filter((c) => c.domain !== undefined), ...['osmosis', 'cosmoshub', 'noble'].flatMap((id) => chainById(id) ?? [])]))
 console.log(`Lahn Bridge API (${network}) on http://localhost:${app.server?.port}`)
 console.log(`Relayer: ${relayer?.account.address ?? 'disabled (set RELAYER_PRIVATE_KEY)'} · indexing ${chains.length} chains`)

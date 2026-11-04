@@ -1,8 +1,9 @@
 import { isAddress } from 'viem'
 import { HttpError } from '../cctp'
-import { canSend, placeholder, resolveChain, sameAccount, validAddress, type ChainInfo } from '../chains'
+import { addressOnSide, canSend, chainById, placeholder, resolveChain, sameAccount, validAddress, type ChainInfo } from '../chains'
 import { network } from '../config'
 import { publicKey } from '../solana'
+import { denomOnSide } from '../tokens'
 import { across } from './across'
 import { debridge } from './debridge'
 import { layerzero } from './layerzero'
@@ -36,13 +37,18 @@ export type QuoteBody = {
 }
 
 // A token the way the chain's token list writes it: a 0x address or a mint, else a denom (ibc/…, factory/…), a coin type…
+// Injective's list has denoms too, for tokens without an ERC20 twin.
+const DENOM = /^[\w\-./:]{1,200}$/
 const validToken = (chain: ChainInfo, value: string) =>
-  chain.kind === 'evm' ? isAddress(value) : chain.kind === 'solana' ? value === SOL || !!publicKey(value) : /^[\w\-./:]{1,200}$/.test(value)
+  chain.kind === 'evm' ? isAddress(value) || (!!chain.cosmosSide && DENOM.test(value)) : chain.kind === 'solana' ? value === SOL || !!publicKey(value) : DENOM.test(value)
 
 // Without a sender (no wallet connected yet) it's a preview: prices only, with stand-in addresses.
 export function quoteRequest(body: QuoteBody): QuoteRequest {
-  const { fromToken, toToken, sender, recipient } = body
+  const { fromToken, toToken } = body
   const [from, to] = [resolveChain(body.from), resolveChain(body.to)]
+  // Injective takes its inj1… form too: from here on, its 0x… one.
+  const evmForm = (chain: ChainInfo | undefined, address?: string) => (address && chain?.cosmosSide ? addressOnSide(address, chain) : address)
+  const [sender, recipient] = [evmForm(from, body.sender), evmForm(to, body.recipient)]
   if (!from || !to || from.id === to.id) throw new HttpError(400, 'Pick two different supported chains.')
   if (!canSend(from)) throw new HttpError(400, `Sending from ${from.name} isn't supported.`)
   if (!validToken(from, fromToken) || !validToken(to, toToken)) throw new HttpError(400, 'Invalid token.')
@@ -84,7 +90,44 @@ export function quotes(req: QuoteRequest, only?: ProviderId[]) {
   return result
 }
 
+// Injective is one chain to the user, with an EVM and a Cosmos side (see ONE_CHAIN in ../chains.ts). A transfer to or from
+// it is asked on both: on the EVM side with ERC20s and 0x addresses, on the Cosmos side (only Skip reaches it) with bank
+// denoms and inj1 addresses. A token with no twin on one side isn't asked there. Into Injective both land in the same
+// account, so a bridge's better route is enough; out of it, each side signs with its own wallet, so both stay.
 async function collect(req: QuoteRequest, only?: ProviderId[]) {
+  const [fromSide, toSide] = [req.from.cosmosSide && chainById(req.from.cosmosSide), req.to.cosmosSide && chainById(req.to.cosmosSide)]
+  if (!fromSide && !toSide) return ask(req, only)
+  const asks: Promise<Collected>[] = []
+  if ((!fromSide || isAddress(req.fromToken)) && (!toSide || isAddress(req.toToken))) asks.push(ask(req, only))
+  const [fromToken, toToken] = await Promise.all([
+    fromSide ? denomOnSide(req.from, req.fromToken) : req.fromToken,
+    toSide ? denomOnSide(req.to, req.toToken) : req.toToken,
+  ])
+  if (fromToken && toToken) {
+    const side = (fromSide || toSide) as ChainInfo
+    // The Cosmos wallet's own account where it gave one: it signs on that side, and may hold a different key.
+    const sender = fromSide ? (req.addresses.find((a) => a.chain.id === fromSide.id)?.address ?? addressOnSide(req.sender, fromSide)) : req.sender
+    const recipient = toSide ? addressOnSide(req.recipient, toSide) : req.recipient
+    const cosmos = { ...req, from: fromSide || req.from, to: toSide || req.to, fromToken, toToken, sender, recipient }
+    asks.push(ask(cosmos, only).then((r) => ({ ...r, quotes: r.quotes.map((q) => ({ ...q, side: side.id })) })))
+  }
+  const rounds = await Promise.all(asks)
+  let found = rounds.flatMap((r) => r.quotes)
+  if (!fromSide) {
+    const best = new Map<ProviderId, Collected['quotes'][number]>()
+    for (const q of found) if (!best.has(q.provider) || BigInt(q.amountOut) > BigInt(best.get(q.provider)!.amountOut)) best.set(q.provider, q)
+    found = [...best.values()]
+  }
+  found.sort(byAmount)
+  // A bridge's error only when it has no route on either side, once.
+  const errors = rounds.flatMap((r) => r.errors).filter((e, i, all) => !found.some((q) => q.provider === e.provider) && all.findIndex((o) => o.provider === e.provider) === i)
+  return { quotes: found, errors }
+}
+
+type Collected = Awaited<ReturnType<typeof ask>>
+const byAmount = (a: Quote, b: Quote) => (BigInt(b.amountOut) > BigInt(a.amountOut) ? 1 : BigInt(b.amountOut) < BigInt(a.amountOut) ? -1 : a.seconds - b.seconds)
+
+async function ask(req: QuoteRequest, only?: ProviderId[]) {
   const asked = providers.filter(
     (p) => active(p) && (!only || only.includes(p.id)) && (coolingUntil.get(p.id) ?? 0) < Date.now() && p.supports(req.from, req.to),
   )
@@ -100,7 +143,7 @@ async function collect(req: QuoteRequest, only?: ProviderId[]) {
     }),
   )
   const found = results.flatMap((r) => (r.quote && valid(req, r.quote) ? [{ ...r.quote, name: providerOf(r.quote.provider)!.name }] : []))
-  found.sort((a, b) => (BigInt(b.amountOut) > BigInt(a.amountOut) ? 1 : BigInt(b.amountOut) < BigInt(a.amountOut) ? -1 : a.seconds - b.seconds))
+  found.sort(byAmount)
   return { quotes: found, errors: results.flatMap((r) => (r.error ? [r.error] : [])) }
 }
 

@@ -16,7 +16,8 @@ type ChainBase = {
   via: string[] // the bridges that reach it
   send: boolean // the app can send from it; the others are destinations only
 }
-export type EvmChain = ChainBase & { kind: 'evm'; chainId: number; rpc?: string; usdc?: Hex }
+// cosmos: the chain's Cosmos side, when the two are one chain (Injective): its routes over IBC start and end there.
+export type EvmChain = ChainBase & { kind: 'evm'; chainId: number; rpc?: string; usdc?: Hex; cosmos?: CosmosChain }
 // Addresses are base58. tokenMessenger and messageTransmitter are the CCTP V2 programs.
 export type SolanaChain = ChainBase & { kind: 'solana'; usdc: string; rpc?: string; tokenMessenger: string; messageTransmitter: string }
 // slip44 is the key type: chains with the same one share an account (60 is Ethereum's: inj1… is the 0x… address).
@@ -179,6 +180,7 @@ export type Quote = {
   usdOut?: number
   steps: Step[] // empty until asked with the sender's address
   needs?: string[] // chains the route passes through where it needs one of the user's addresses (chain ids)
+  side?: string // the id of Injective's Cosmos side, when the route starts or ends there instead of the EVM side
   track: Record<string, string>
 }
 export type QuoteBody = {
@@ -203,7 +205,7 @@ export const getTokens = (chain: string, q = '') => call<{ popular: Token[]; tok
 // Solana's public RPC turns browsers away, so Solana (and Cosmos) balances come from the server only.
 export function tokenBalance(chain: Chain, owner: string, token: string, signal?: AbortSignal): Promise<bigint> {
   const server = call<{ raw: string }>(`/balance/${chain.id}/${owner}?token=${encodeURIComponent(token)}`, { signal }).then((r) => BigInt(r.raw))
-  if (chain.kind !== 'evm' || !chain.rpc) return server
+  if (chain.kind !== 'evm' || !chain.rpc || !token.startsWith('0x')) return server // Injective's denoms: the server reads them
   const direct = token === NATIVE
     ? rpc(chain.rpc, 'eth_getBalance', [owner, 'latest'], signal)
     : rpc(chain.rpc, 'eth_call', [{ to: token, data: encode.balanceOf(owner as Hex) }, 'latest'], signal)

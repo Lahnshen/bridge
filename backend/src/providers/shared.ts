@@ -64,6 +64,7 @@ export type Quote = {
   costNative?: string // the fees charged in the source chain's gas token (tx value beyond the amount), when there's no USD price
   steps: Step[] // empty for previews
   needs?: string[] // chains the route passes through where it needs one of the user's addresses (registry ids)
+  side?: string // for a chain with a Cosmos side (Injective): that side's registry id, when the route starts or ends there
   track: Record<string, string> // what status() needs besides the source tx hash
 }
 

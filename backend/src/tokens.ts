@@ -1,13 +1,14 @@
 import { erc20Abi, getAddress, isAddress, type Hex } from 'viem'
 import { HttpError } from './cctp'
-import { evmClient, HYPERLIQUID_API, NATIVE, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
+import { addressOnSide, chainById, evmClient, HYPERLIQUID_API, NATIVE, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
 import { cosmosBalance } from './cosmos'
 import { publicKey, solanaRpc } from './solana'
 
 // Tokens the bridge can send and receive, per chain. Each chain's list comes from one bridge's catalog: LI.FI's where it
 // has the chain, else Skip's (Cosmos chains), Relay's, LayerZero's or deBridge's (see `tokens` in ../chains.ts). A list is
 // loaded when first asked for and kept 6 hours, without the tokens LI.FI flags as scams. An EVM or Solana token outside
-// the list can be found by its address, read from the chain.
+// the list can be found by its address, read from the chain. Injective's list has both its sides' tokens, each once (see
+// sideTokens).
 
 export type Token = {
   chain: string // chain id
@@ -155,10 +156,62 @@ function catalog(chain: ChainInfo): Promise<Token[]> {
       const t = own.find((t) => sameAddress(t.address, b.address))
       return { ...b, logo: t?.logo ?? b.logo, priceUsd: t?.priceUsd }
     })
-    return [...base, ...own.filter((t) => !base.some((b) => sameAddress(b.address, t.address)))].map((t) => ({ chain: chain.id, ...t }))
+    const list = [...base, ...own.filter((t) => !base.some((b) => sameAddress(b.address, t.address)))].map((t) => ({ chain: chain.id, ...t }))
+    return chain.cosmosSide ? sideTokens(chain, list).catch(() => ((entry.ttl = 60_000), list)) : list
   })()
   catalogs.set(chain.id, entry)
   return entry.list
+}
+
+// ---- A chain's Cosmos side (Injective) -----------------------------------------------------------------
+
+// Injective's MultiVM tokens: each bank denom (inj, peggy0x…, ibc/…, factory/…, erc20:0x…) and its ERC20 twin, from the
+// chain's erc20 module. Kept 6 hours.
+type Pairs = { erc20: Map<string, string>; denom: Map<string, string> } // denom → ERC20, lowercased ERC20 → denom
+const pairCache = new Map<string, { at: number; pairs: Promise<Pairs> }>()
+function tokenPairs(side: ChainInfo): Promise<Pairs> {
+  const hit = pairCache.get(side.id)
+  if (hit && Date.now() - hit.at < 6 * 3600_000) return hit.pairs
+  const pairs = getList<{ token_pairs: { bank_denom: string; erc20_address: string }[] }>(
+    `${side.rest}/injective/erc20/v1beta1/all_token_pairs?pagination.limit=10000`,
+  ).then(({ token_pairs }) => {
+    // Some ERC20s also have an erc20:0x… pair beside their own denom (ibc/…, factory/…), which is the one bridges take.
+    const own = [...token_pairs].sort((a, b) => Number(b.bank_denom.startsWith('erc20:')) - Number(a.bank_denom.startsWith('erc20:')))
+    return {
+      erc20: new Map(token_pairs.map((p) => [p.bank_denom, getAddress(p.erc20_address)])),
+      denom: new Map(own.map((p) => [p.erc20_address.toLowerCase(), p.bank_denom])),
+    }
+  })
+  pairCache.set(side.id, { at: Date.now(), pairs })
+  pairs.catch(() => pairCache.delete(side.id))
+  return pairs
+}
+
+// The EVM side's list, plus the Cosmos side's tokens it lacks: by their ERC20 twin's address where they have one (the
+// same token, which both sides' bridges take), else by denom.
+async function sideTokens(chain: ChainInfo, list: Token[]) {
+  const side = chainById(chain.cosmosSide!)
+  if (!side) return list
+  const [theirs, pairs] = await Promise.all([catalog(side), tokenPairs(side)])
+  const merged = [...list]
+  for (const t of theirs) {
+    if (side.native && t.address === side.native.address) continue // INJ: the EVM side's gas token
+    const erc20 = pairs.erc20.get(t.address)
+    const same = erc20 ? merged.findIndex((m) => sameAddress(m.address, erc20)) : -1
+    if (same >= 0) merged[same] = { ...merged[same]!, logo: merged[same]!.logo ?? t.logo }
+    else merged.push({ ...t, chain: chain.id, address: erc20 ?? t.address })
+  }
+  return merged
+}
+
+// A token of a chain with a Cosmos side, as that side writes it: the gas token's denom, an ERC20's bank denom (none when
+// it has no twin), or the denom itself.
+export async function denomOnSide(chain: ChainInfo, token: string) {
+  const side = chainById(chain.cosmosSide!)
+  if (!side?.native) return
+  if (sameAddress(token, NATIVE)) return side.native.address
+  if (!isAddress(token)) return token
+  return (await tokenPairs(side).catch(() => undefined))?.denom.get(token.toLowerCase())
 }
 
 // The lists people open first, loaded ahead: one chain at a time, to go easy on the APIs.
@@ -197,7 +250,10 @@ export async function tokens(id: string | number, query = '') {
     const rest = list.filter((t) => t.verified && !top.includes(t))
     return { popular: top, tokens: [...top, ...rest.filter((t) => t.logo), ...rest.filter((t) => !t.logo)].slice(0, 100) }
   }
-  const exact = list.find((t) => sameAddress(t.address, q) || (chain.kind === 'cosmos' && t.address.toLowerCase() === q.toLowerCase()))
+  // Injective lists a token with an ERC20 twin by the twin's address; its denom finds it too.
+  const side = chain.cosmosSide ? chainById(chain.cosmosSide) : undefined
+  const twin = side && !isAddress(q) ? (await tokenPairs(side).catch(() => undefined))?.erc20.get(q) : undefined
+  const exact = list.find((t) => sameAddress(t.address, twin ?? q) || ((chain.kind === 'cosmos' || !!side) && t.address.toLowerCase() === q.toLowerCase()))
   if (exact) return { popular: [], tokens: [exact] }
   if (isTokenAddress(chain, q)) return { popular: [], tokens: [await lookup(chain, q)] }
   const needle = q.toLowerCase()
@@ -255,8 +311,14 @@ async function lookupMint(chain: ChainInfo, mint: string): Promise<Token> {
 }
 
 // Base units of a token held by an address, on the chains the app sends from.
-export async function tokenBalance(id: string | number, owner: string, token: string) {
+export async function tokenBalance(id: string | number, owner: string, token: string): Promise<{ raw: string }> {
   const chain = knownChain(id)
+  // Injective: a denom without an ERC20 twin is read on the Cosmos side; the rest on the EVM side, by the 0x address.
+  const side = chain.cosmosSide ? chainById(chain.cosmosSide) : undefined
+  if (side && validAddress(chain, owner)) {
+    if (!isAddress(token)) return tokenBalance(side.id, addressOnSide(owner, side), token)
+    owner = addressOnSide(owner, chain)
+  }
   const validToken = chain.kind === 'evm' ? isAddress(token) : chain.kind === 'solana' ? token === SOL || !!publicKey(token) : /^[\w\-./:]{1,200}$/.test(token)
   if (!validAddress(chain, owner) || !validToken) throw new HttpError(400, 'Invalid address.')
   const unreachable = () => {

@@ -8,9 +8,9 @@
   import { fade, slide } from 'svelte/transition'
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
-  import { addressHint, injectiveAddress, parseAddress, walletKind } from '$lib/address'
-  import { getFees, getQuotes, getTokens, INJECTIVE, isNative, sameToken, tokenBalance, type CctpChain, type Chain, type EvmChain, type Fees, type Hex, type Quote, type QuoteBody, type Token } from '$lib/api'
-  import { app, chainById, chainOf, injective, navigate, setBridgeQuery } from '$lib/app.svelte'
+  import { addressHint, parseAddress, walletKind } from '$lib/address'
+  import { getFees, getQuotes, getTokens, INJECTIVE, isNative, sameToken, tokenBalance, type CctpChain, type Chain, type CosmosChain, type EvmChain, type Fees, type Hex, type Quote, type QuoteBody, type Token } from '$lib/api'
+  import { app, chainById, chainOf, injective, listedChain, navigate, setBridgeQuery } from '$lib/app.svelte'
   import { addressFromWallet, connectCosmosWallet, cosmosWallet, derivedAddress } from '$lib/cosmos-wallet.svelte'
   import { amountString, encode, formatToken, formatUsdc, forwardHook, parseAmount, parseUsdc, short, type Burn } from '$lib/evm'
   import { history, historyKey, updateHistory } from '$lib/history.svelte'
@@ -56,7 +56,7 @@
       return undefined
     }
   })()
-  const savedChain = (ref?: string | number) => (typeof ref === 'number' ? chainOf(ref) : chainById(ref))
+  const savedChain = (ref?: string | number) => (typeof ref === 'number' ? chainOf(ref) : listedChain(chainById(ref)))
   const savedToken = (saved?: SavedToken): Token | undefined => {
     if (!saved) return
     const { priceUsd, ...token } = saved // a saved price is out of date
@@ -65,7 +65,7 @@
     return chain && { ...token, chain: chain.id }
   }
   const link = new URLSearchParams(location.search)
-  const [linkFrom, linkTo] = [chainById(link.get('from')), chainById(link.get('to'))]
+  const [linkFrom, linkTo] = [listedChain(chainById(link.get('from'))), listedChain(chainById(link.get('to')))]
   const linked = !!(linkFrom || linkTo)
   const start = linked ? { from: linkFrom, to: linkTo } : { from: savedChain(saved?.from), to: savedChain(saved?.to) }
   const ethereum = chainById('ethereum') ?? app.chains[0]!
@@ -199,19 +199,25 @@
 
   // The connected wallet's address on a chain: the EVM wallet's on EVM chains (and Hyperliquid, Lighter), the Solana
   // wallet's on Solana and Eclipse, and on Cosmos chains the Cosmos wallet's, which it gives per chain. To receive, an
-  // address the account surely has there does too (see derivedAddress), and on Injective's Cosmos side, the EVM wallet's
-  // (its inj1… address is the 0x… one).
+  // address the account surely has there does too (see derivedAddress). On Injective without an EVM wallet, the Cosmos
+  // wallet's inj1… account, as 0x… (the same account).
   function addressOn(chain: Chain, receiving = false) {
     const kind = walletKind(chain)
-    if (kind === 'evm') return wallet.address?.toLowerCase()
+    if (kind === 'evm') return wallet.address?.toLowerCase() ?? cosmosSideAddress(chain)
     if (kind === 'solana') return solanaWallet.address
     if (chain.kind !== 'cosmos') return
-    if (!receiving) return cosmosWallet.addresses[chain.id]
-    return derivedAddress(chain) ?? (chain.id === 'injective-cosmos' && wallet.address ? injectiveAddress(wallet.address) : undefined)
+    return receiving ? derivedAddress(chain) : cosmosWallet.addresses[chain.id]
   }
+  const cosmosSideAddress = (chain: Chain) => {
+    const theirs = chain.kind === 'evm' && chain.cosmos ? cosmosWallet.addresses[chain.cosmos.id] : undefined
+    return theirs && parseAddress(chain, theirs)
+  }
+  // Injective's Cosmos side, where the Cosmos wallet is connected and the EVM wallet isn't: that wallet signs there.
+  const cosmosOnly = (chain: Chain) => (chain.kind === 'evm' && chain.cosmos && cosmosWallet.connected && !wallet.address ? chain.cosmos : undefined)
   const sender = $derived(addressOn(source))
 
-  async function connectFor(chain: Chain) {
+  async function connectFor(picked: Chain) {
+    const chain = cosmosOnly(picked) ?? picked
     const kind = walletKind(chain)
     if (kind === 'evm') return connectWallet()
     if (kind === 'solana') return connectSolanaWallet()
@@ -225,6 +231,7 @@
     }
   }
   const connectLabel = (chain: Chain) => {
+    if (cosmosOnly(chain)) return `Use ${cosmosWallet.connected!.name} on ${chain.name}`
     const kind = walletKind(chain)
     if (kind === 'solana') return 'Connect Solana wallet'
     if (kind !== 'cosmos') return 'Connect wallet'
@@ -347,6 +354,9 @@
 
   // ---- Other bridges' quotes ------------------------------------------------------------------------
 
+  // A bridge can have two routes to or from Injective, one on each side.
+  const routeKey = (q: Quote) => (q.side ? `${q.provider}:${q.side}` : q.provider)
+
   // The user's Cosmos accounts the wallet gave, for routes that pass through those chains.
   const known = $derived(Object.keys(cosmosWallet.addresses).length ? { ...cosmosWallet.addresses } : undefined)
   let quotes = $state<Quote[]>([])
@@ -405,8 +415,11 @@
   // CCTP with the speed and delivery picked below, and every other bridge's quote. Best first (see score); on a tie, CCTP.
   const options = $derived.by((): RouteOption[] => {
     const list: RouteOption[] = quotes.map((q) => ({
-      id: q.provider,
+      id: routeKey(q),
+      provider: q.provider,
       name: q.name,
+      // Out of Injective, a route from its Cosmos side is signed by the Cosmos wallet.
+      tag: q.side && source.kind === 'evm' && source.cosmos?.id === q.side ? 'Cosmos wallet' : undefined,
       via: q.via?.replace(/\s*\(.*\)$/, ''), // "StargateV2 (Fast mode)" is too long for the row
       out: BigInt(q.amountOut),
       min: BigInt(q.minAmountOut),
@@ -417,7 +430,7 @@
     }))
     if (cctp && fees && amount && receive && maxFee < amount && !(mustForward && !useForward)) {
       const time = useFast || !fees.standardTime ? '< 1 min' : fees.standardTime
-      list.unshift({ id: 'cctp', name: 'Circle CCTP', out: receive, min: receive, seconds: useFast || !fees.standardTime ? 30 : 1200, time, fee: fee ? `${formatUsdc(fee)} USDC fee` : 'No fee' })
+      list.unshift({ id: 'cctp', provider: 'cctp', name: 'Circle CCTP', out: receive, min: receive, seconds: useFast || !fees.standardTime ? 30 : 1200, time, fee: fee ? `${formatUsdc(fee)} USDC fee` : 'No fee' })
     }
     // Waiting counts as 0.01% of the amount a minute, so a route a few cents better but twenty minutes slower doesn't win.
     const score = (o: RouteOption) => o.out * (1_000_000n - BigInt(Math.min(Math.round((o.seconds / 60) * 100), 500_000)))
@@ -433,7 +446,7 @@
     picked = undefined
   })
   const selected = $derived(options.find((o) => o.id === picked) ?? options[0])
-  const selectedQuote = $derived(quotes.find((q) => q.provider === selected?.id))
+  const selectedQuote = $derived(quotes.find((q) => routeKey(q) === selected?.id))
   // Chains the selected route passes through, where it needs one of the user's addresses.
   const needs = $derived((selectedQuote?.needs ?? []).map((id) => chainById(id)?.name ?? id))
 
@@ -584,10 +597,25 @@
   }
 
   // Through another bridge: a fresh quote with the real addresses, then its transactions.
+  // Injective's Cosmos side, when the route starts or ends there: the transfer's transactions are that side's.
+  const sideOf = (chain: Chain, side?: string) => (chain.kind === 'evm' && chain.cosmos && chain.cosmos.id === side ? chain.cosmos : undefined)
+  // The Cosmos wallet's account on Injective's Cosmos side, which signs there.
+  async function cosmosSigner(side: CosmosChain) {
+    if (!cosmosWallet.connected) {
+      void connectCosmosWallet(side)
+      throw new Error(`This route starts on ${side.name}'s Cosmos side: connect Keplr, Leap or Cosmostation, then send again.`)
+    }
+    busy = `Getting your ${side.name} address…`
+    return cosmosWallet.addresses[side.id] ?? (await addressFromWallet(side))
+  }
+
   async function submitRoute(option: RouteOption) {
     const [from, to, value, tokenIn, tokenOut] = [source, destination, amount!, fromToken, toToken]
+    const side = quotes.find((q) => routeKey(q) === option.id)?.side
+    const [fromSide, toSide] = [sideOf(from, side), sideOf(to, side)]
     error = ''
     try {
+      const addresses = fromSide ? { ...known, [fromSide.id]: await cosmosSigner(fromSide) } : known
       busy = 'Getting a fresh quote…'
       const body: QuoteBody = {
         from: from.id,
@@ -597,20 +625,21 @@
         amount: String(value),
         sender,
         recipient,
-        addresses: known,
+        addresses,
         slippageBps: slippage,
-        providers: [option.id],
+        providers: [option.provider],
       }
-      let [fresh] = (await getQuotes(body)).quotes
+      const pick = ({ quotes }: { quotes: Quote[] }) => quotes.find((q) => routeKey(q) === option.id)
+      let fresh = pick(await getQuotes(body))
       if (fresh?.needs?.length) {
         body.addresses = { ...body.addresses, ...(await addressesFor(fresh.needs)) }
         busy = 'Getting a fresh quote…'
-        ;[fresh] = (await getQuotes(body)).quotes
+        fresh = pick(await getQuotes(body))
       }
       if (!fresh?.steps.length) throw new Error(`${option.name} can't do this transfer right now, pick another route.`)
       // Half a percent of slack; beyond that, show the new price first.
       if (BigInt(fresh.amountOut) * 1000n < option.out * 995n) {
-        quotes = quotes.map((q) => (q.provider === fresh!.provider ? fresh! : q))
+        quotes = quotes.map((q) => (routeKey(q) === option.id ? fresh! : q))
         throw new Error('The price moved: check the new amount and send again.')
       }
       const hash = await runSteps(from, fresh.steps, (label) => (busy = label), app.config!.network === 'testnet')
@@ -620,8 +649,8 @@
       const route: Route = { provider: fresh.provider, name: fresh.name, via: fresh.via, track: fresh.track, fromToken: info(tokenIn), toToken: info(tokenOut), amountOut: fresh.amountOut }
       const item = addRecent({
         txHash: hash,
-        from: from.id,
-        to: to.id,
+        from: (fromSide ?? from).id,
+        to: (toSide ?? to).id,
         sourceDomain: from.domain,
         destinationDomain: to.domain,
         amount: amountString(value, tokenIn.decimals),
@@ -634,7 +663,7 @@
       if (sent) {
         balanceAttempt++
         void refresh(item)
-      } else follow(from, hash, item)
+      } else follow(fromSide ?? from, hash, item)
     } catch (err) {
       error = walletError(err) ?? ''
     } finally {

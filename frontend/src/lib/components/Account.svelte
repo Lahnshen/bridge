@@ -6,13 +6,17 @@
   import WalletIcon from '@lucide/svelte/icons/wallet'
   import { Button } from '$lib/components/ui/button'
   import { short } from '$lib/evm'
+  import { chainById } from '$lib/app.svelte'
+  import { cosmosWallet, disconnectCosmos } from '$lib/cosmos-wallet.svelte'
   import { disconnectSolana, solanaWallet } from '$lib/solana-wallet.svelte'
   import { cn } from '$lib/utils'
   import { connectWallet, disconnect, wallet } from '$lib/wallet.svelte'
 
-  // A connected wallet (EVM, or Solana): a full row in the sidebar, a small pill in the mobile header.
-  let { compact = false, kind = 'evm' }: { compact?: boolean; kind?: 'evm' | 'solana' } = $props()
-  const connected = $derived(kind === 'solana' ? solanaWallet : wallet)
+  // A connected wallet (EVM, Solana or Cosmos): a full row in the sidebar, a small pill in the mobile header. A Cosmos
+  // wallet shows its address on the chain it was last connected for.
+  let { compact = false, kind = 'evm' }: { compact?: boolean; kind?: 'evm' | 'solana' | 'cosmos' } = $props()
+  const connected = $derived(kind === 'solana' ? solanaWallet : kind === 'cosmos' ? cosmosWallet : wallet)
+  const network = $derived(kind === 'solana' ? 'Solana' : kind === 'cosmos' ? (chainById(cosmosWallet.chain)?.name ?? 'Cosmos') : '')
 
   let open = $state(false)
   let copied = $state(false)
@@ -58,7 +62,7 @@
         {@render avatar('size-7')}
         <span class="min-w-0 flex-1">
           <span class="block truncate font-mono text-xs">{short(connected.address)}</span>
-          <span class="text-muted-foreground block truncate text-[11px]">{connected.connected?.name ?? 'Wallet'}{kind === 'solana' ? ' · Solana' : ''}</span>
+          <span class="text-muted-foreground block truncate text-[11px]">{connected.connected?.name ?? 'Wallet'}{network ? ` · ${network}` : ''}</span>
         </span>
         <EllipsisIcon class="text-muted-foreground size-4" />
       {/if}
@@ -81,6 +85,7 @@
           onclick={() => {
             open = false
             if (kind === 'solana') disconnectSolana()
+            else if (kind === 'cosmos') disconnectCosmos()
             else disconnect()
           }}
         >

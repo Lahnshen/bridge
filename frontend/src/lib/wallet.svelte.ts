@@ -19,7 +19,7 @@ export const wallet = $state({
   connected: undefined as WalletInfo | undefined,
   address: undefined as Hex | undefined,
   chainId: undefined as number | undefined,
-  picking: false as false | 'evm' | 'solana', // the wallet picker dialog is open, for this kind of wallet
+  picking: false as false | 'evm' | 'solana' | 'cosmos', // the wallet picker dialog is open, for this kind of wallet
 })
 
 function announce(info: WalletInfo, p: Provider) {
@@ -103,8 +103,12 @@ export async function switchChain(chain: EvmChain) {
   } catch (err) {
     const e = err as { code?: number; message?: string; data?: { originalError?: { code?: number } } }
     if (e.code !== 4902 && e.data?.originalError?.code !== 4902 && !/unrecognized|not been added|unknown chain/i.test(e.message ?? '')) throw err
+    if (!chain.rpc || !chain.native) throw new Error(`Add ${chain.name} to your wallet, then try again.`)
+    const { symbol, name, decimals } = chain.native
+    // The explorer's home page: its transaction link up to /tx/.
+    const explorer = chain.explorer?.split(/\/tx\//)[0]
     await request('wallet_addEthereumChain', [
-      { chainId, chainName: chain.name, nativeCurrency: chain.nativeCurrency, rpcUrls: [chain.rpc], blockExplorerUrls: chain.explorer ? [chain.explorer] : undefined },
+      { chainId, chainName: chain.name, nativeCurrency: { symbol, name, decimals }, rpcUrls: [chain.rpc], blockExplorerUrls: explorer ? [explorer] : undefined },
     ])
     await request('wallet_switchEthereumChain', [{ chainId }]).catch(() => {}) // most wallets already switched when adding
   }
@@ -116,14 +120,16 @@ export const call = (to: Hex, data: Hex): Promise<Hex> => request('eth_call', [{
 
 // EIP-712 typed data, signed by the connected account. Wallets check its domain's chainId against the current chain.
 export const signTypedData = (data: object): Promise<Hex> => request('eth_signTypedData_v4', [wallet.address, JSON.stringify(data)])
+export const currentChain = async () => (wallet.chainId = Number(await request('eth_chainId')))
 
-type Tx = { to: Hex; data: Hex }
+type Tx = { to: Hex; data: Hex; value?: bigint; gas?: bigint }
 
-// chainId makes the wallet refuse the tx if the user changed networks in the meantime.
-export async function sendTx(chain: EvmChain, tx: Tx, { padGas = false } = {}): Promise<Hex> {
-  const params = { from: wallet.address, chainId: hex(chain.chainId), ...tx }
-  const gas = padGas ? (BigInt(await request('eth_estimateGas', [{ from: params.from, ...tx }])) * 3n) / 2n : undefined
-  return request('eth_sendTransaction', [{ ...params, ...(gas && { gas: hex(gas) }) }])
+// chainId makes the wallet refuse the tx if the user changed networks in the meantime. gas, when given, is used as is;
+// padGas estimates it with headroom (Injective's estimates run short).
+export async function sendTx(chain: EvmChain, { value, gas, ...tx }: Tx, { padGas = false } = {}): Promise<Hex> {
+  const params = { from: wallet.address, chainId: hex(chain.chainId), ...tx, ...(value && { value: hex(value) }) }
+  const limit = gas ?? (padGas ? (BigInt(await request('eth_estimateGas', [{ from: params.from, ...tx, ...(value && { value: hex(value) }) }])) * 3n) / 2n : undefined)
+  return request('eth_sendTransaction', [{ ...params, ...(limit && { gas: hex(limit) }) }])
 }
 
 // Resolves to whether the transaction succeeded.
@@ -140,7 +146,7 @@ export async function waitForReceipt(hash: Hex, timeoutMs = 300_000) {
 // A short message for a failed wallet request, or undefined when the user cancelled it.
 export function walletError(err: unknown) {
   const e = err as { code?: number; message?: string; data?: { message?: string } }
-  if (e?.code === 4001 || /user (rejected|denied|cancel)/i.test(e?.message ?? '')) return
+  if (e?.code === 4001 || /user (rejected|denied|cancel)|^request rejected|rejected by (the )?user/i.test(e?.message ?? '')) return
   if (e?.code === -32002) return 'Your wallet already has a request open, check it first.'
   return (e?.data?.message ?? e?.message ?? String(err)).split('\n')[0]!.slice(0, 200)
 }

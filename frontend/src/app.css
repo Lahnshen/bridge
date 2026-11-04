@@ -132,3 +132,79 @@
 	background-image: radial-gradient(var(--dots) 1px, transparent 1px);
 	background-size: 18px 18px;
 }
+
+/* Placeholder rows while a list loads: a soft sheen passing over. */
+@utility skeleton {
+	background: linear-gradient(90deg, var(--muted) 25%, color-mix(in oklch, var(--muted), var(--foreground) 6%) 50%, var(--muted) 75%);
+	background-size: 200% 100%;
+	animation: shimmer 1.2s ease-in-out infinite;
+}
+@keyframes shimmer {
+	from {
+		background-position: 100% 0;
+	}
+	to {
+		background-position: -100% 0;
+	}
+}
+
+/* Dialogs fade and grow in, and out again, over a dimmed page. */
+dialog {
+	transition:
+		opacity 0.16s ease-out,
+		scale 0.16s ease-out,
+		overlay 0.16s allow-discrete,
+		display 0.16s allow-discrete;
+	opacity: 0;
+	scale: 0.97;
+}
+dialog[open] {
+	opacity: 1;
+	scale: 1;
+}
+@starting-style {
+	dialog[open] {
+		opacity: 0;
+		scale: 0.97;
+	}
+}
+dialog::backdrop {
+	background: rgb(0 0 0 / 0.5);
+	backdrop-filter: blur(2px);
+	transition:
+		opacity 0.16s ease-out,
+		overlay 0.16s allow-discrete,
+		display 0.16s allow-discrete;
+	opacity: 0;
+}
+dialog[open]::backdrop {
+	opacity: 1;
+}
+@starting-style {
+	dialog[open]::backdrop {
+		opacity: 0;
+	}
+}
+
+/* Numbers that update in place (amounts out, balances) settle in rather than jump. */
+@keyframes settle {
+	from {
+		opacity: 0.35;
+		translate: 0 2px;
+	}
+}
+@utility settle {
+	animation: settle 0.22s ease-out;
+}
+
+/* Less motion, where the system asks for it: no transitions or decorative animations (spinners still turn). */
+@media (prefers-reduced-motion: reduce) {
+	*:not(.animate-spin),
+	*::before,
+	*::after,
+	dialog::backdrop {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
+}

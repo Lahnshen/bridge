@@ -2,6 +2,7 @@
   import WalletIcon from '@lucide/svelte/icons/wallet'
   import XIcon from '@lucide/svelte/icons/x'
   import { Spinner } from '$lib/components/ui/spinner'
+  import { connectCosmos, cosmosWallet } from '$lib/cosmos-wallet.svelte'
   import { connectSolana, solanaWallet } from '$lib/solana-wallet.svelte'
   import { connect, wallet, walletError } from '$lib/wallet.svelte'
 
@@ -17,15 +18,20 @@
     } else if (!wallet.picking && dialog.open) dialog.close()
   })
 
-  // EVM wallets, or Solana ones when connecting for Solana.
-  const solana = $derived(wallet.picking === 'solana')
-  const options = $derived(solana ? solanaWallet.available : wallet.available)
+  // EVM wallets, or Solana or Cosmos ones when connecting for those chains.
+  const KINDS = {
+    evm: { title: 'Connect a wallet', install: 'MetaMask or Rabby' },
+    solana: { title: 'Connect a Solana wallet', install: 'Phantom or Solflare' },
+    cosmos: { title: 'Connect a Cosmos wallet', install: 'Keplr or Leap' },
+  }
+  const kind = $derived(wallet.picking || 'evm')
+  const options = $derived(kind === 'solana' ? solanaWallet.available : kind === 'cosmos' ? cosmosWallet.available : wallet.available)
 
   async function pick(id: string) {
     connecting = id
     error = ''
     try {
-      await (solana ? connectSolana(id) : connect(id))
+      await (kind === 'solana' ? connectSolana(id) : kind === 'cosmos' ? connectCosmos(id) : connect(id))
     } catch (err) {
       error = walletError(err) ?? ''
     } finally {
@@ -36,13 +42,13 @@
 
 <dialog
   bind:this={dialog}
-  class="bg-popover text-popover-foreground backdrop:bg-black/50 m-auto w-[min(100%-2rem,22rem)] rounded-lg border p-0 shadow-2xl backdrop:backdrop-blur-[2px]"
+  class="bg-popover text-popover-foreground m-auto w-[min(100%-2rem,22rem)] rounded-lg border p-0 shadow-2xl"
   aria-labelledby="wallet-title"
   onclose={() => (wallet.picking = false)}
   onclick={(event) => event.target === dialog && dialog?.close()}
 >
   <div class="flex items-center justify-between px-4 pt-4 pb-3">
-    <h2 id="wallet-title" class="text-sm font-semibold tracking-tight">Connect a {solana ? 'Solana ' : ''}wallet</h2>
+    <h2 id="wallet-title" class="text-sm font-semibold tracking-tight">{KINDS[kind].title}</h2>
     <button class="text-muted-foreground hover:text-foreground -mr-1 rounded-md p-1" aria-label="Close" onclick={() => dialog?.close()}>
       <XIcon class="size-4" />
     </button>
@@ -50,7 +56,7 @@
   <div class="flex flex-col gap-1 px-2 pb-2">
     {#each options as option (option.id)}
       <button
-        class="hover:bg-muted flex h-11 items-center gap-3 rounded-md px-2.5 text-left text-[13px] font-medium transition-colors disabled:opacity-60"
+        class="hover:bg-muted flex h-11 items-center gap-3 rounded-md px-2.5 text-left text-[13px] font-medium transition-[background-color,scale] active:scale-[0.98] disabled:opacity-60"
         disabled={!!connecting}
         onclick={() => pick(option.id)}
       >
@@ -64,7 +70,7 @@
       </button>
     {:else}
       <p class="text-muted-foreground px-2.5 pb-3 text-xs leading-relaxed">
-        No wallet found. Install a browser wallet like {solana ? 'Phantom or Solflare' : 'MetaMask or Rabby'}, then reload this page.
+        No wallet found. Install a browser wallet like {KINDS[kind].install}, then reload this page.
       </p>
     {/each}
     {#if error}

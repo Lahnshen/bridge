@@ -2,9 +2,14 @@ import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
 import { autoRedeem, balance, fees, history, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
 import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, solana, TOKEN_MESSENGER, trustProxy } from './config'
+import { allChains, canSend, chainById, ready, resolveChain, type ChainInfo } from './chains'
+import { broadcast, prepare, txStatus } from './cosmos'
 import { historyFrom, indexedBlocks, queuedTxs, startIndexer } from './indexer'
 import { SolanaRpcError, solanaRpc } from './solana'
 import { resumeSwaps, swap, swapQuote, swapsEnabled } from './swap'
+import { providerList, providersOn, quoteRequest, quotes, status as routeStatus } from './providers'
+import { ProviderError, type ProviderId } from './providers/shared'
+import { tokenBalance, tokens, warmTokens } from './tokens'
 
 // Fixed-window counter per client IP.
 function rateLimit(max: number, windowMs = 60_000) {
@@ -28,6 +33,7 @@ const chainInfo = {
   network,
   autoRedeem: !!relayer,
   swap: swapsEnabled, // USDC → INJ on Injective, see /swap
+  providers: providerList(), // bridges quoted besides CCTP, see /quotes
   tokenMessenger: TOKEN_MESSENGER,
   messageTransmitter: MESSAGE_TRANSMITTER,
   chains: chains.map(({ domain, name, chain, usdc }) => ({
@@ -50,6 +56,53 @@ const chainInfo = {
   },
 }
 const domainId = t.Integer({ minimum: 0 })
+const chainRef = t.Union([t.String({ maxLength: 64 }), domainId]) // a chain id, or a CCTP domain
+
+// Every chain the bridges reach, for the chain picker. send: the app can send from it (EVM, Solana, and Cosmos chains
+// with a REST endpoint); via: the bridges that reach it. rpc and rest are public, for wallets that have to add the chain.
+let networks: { from: ChainInfo[]; list: unknown[] } | undefined
+function networkList() {
+  const chains = allChains()
+  if (networks?.from === chains) return networks.list
+  const list = chains.map((c) => ({
+    id: c.id,
+    name: c.name,
+    kind: c.kind,
+    logo: c.logo,
+    domain: c.domain,
+    chainId: c.chainId,
+    cosmosId: c.cosmosId,
+    bech32: c.bech32,
+    slip44: c.slip44,
+    rpc: c.rpc,
+    rest: c.rest,
+    explorer: c.explorer,
+    native: c.native,
+    gas: c.gas,
+    usdc: c.usdc,
+    via: providersOn(c),
+    send:
+      canSend(c) &&
+      (c.kind !== 'cosmos' || (!!c.rest && !!c.gas && providersOn(c).includes('skip'))) &&
+      (c.kind !== 'hypercore' || providersOn(c).includes('relay')),
+  }))
+  networks = { from: chains, list }
+  return list
+}
+let chainsBody: { list: unknown[]; text: string; gzip: Uint8Array<ArrayBuffer> } | undefined
+function chainsJson() {
+  const list = networkList()
+  if (chainsBody?.list !== list) {
+    const text = JSON.stringify({ ...chainInfo, networks: list })
+    chainsBody = { list, text, gzip: Bun.gzipSync(text) as Uint8Array<ArrayBuffer> }
+  }
+  return chainsBody
+}
+const knownChain = (id: string | number) => {
+  const chain = resolveChain(id)
+  if (!chain) throw new HttpError(404, 'Unknown chain.')
+  return chain
+}
 const SOLANA_METHODS = new Set(['getLatestBlockhash', 'sendTransaction', 'getSignatureStatuses', 'getAccountInfo'])
 
 const app = new Elysia()
@@ -75,6 +128,7 @@ const app = new Elysia()
   })
   .onError(({ code, error, status }) => {
     if (error instanceof HttpError) return status(error.status, { error: error.message })
+    if (error instanceof ProviderError) return status(502, { error: error.message }) // a bridge provider's own error
     if (code === 'VALIDATION' || code === 'PARSE') return status(400, { error: 'Invalid request.' })
     if (code === 'NOT_FOUND') return status(404, { error: 'Not found.' })
     console.error(error)
@@ -88,13 +142,71 @@ const app = new Elysia()
     indexedBlocks: indexedBlocks(),
     historyFromBlock: historyFrom(), // how far back Injective's history is indexed so far
   }))
-  .get('/chains', () => chainInfo)
+  // Waits (a few seconds at most) for the bridges' chain lists after a restart. Gzipped: the list is ~100 kB of JSON.
+  .get('/chains', async ({ request, set }) => {
+    await Promise.race([ready, new Promise((resolve) => setTimeout(resolve, 8000))])
+    const json = chainsJson()
+    if (!request.headers.get('accept-encoding')?.includes('gzip')) return new Response(json.text, { headers: { ...(set.headers as Record<string, string>), 'content-type': 'application/json' } })
+    return new Response(json.gzip, { headers: { ...(set.headers as Record<string, string>), 'content-type': 'application/json', 'content-encoding': 'gzip' } })
+  })
   .get('/fees/:from/:to', ({ params, query }) => fees(params.from, params.to, query.recipientSetup === 'true'), {
     params: t.Object({ from: domainId, to: domainId }),
     query: t.Object({ recipientSetup: t.Optional(t.String()) }),
   })
-  .get('/balance/:domain/:address', ({ params }) => balance(params.domain, params.address), {
-    params: t.Object({ domain: domainId, address: t.String() }),
+  // USDC by default; with ?token= any token, as { raw } base units. async on purpose: Elysia only awaits handlers it can
+  // tell are async (from their source), and a rejected promise it didn't await skips onError and crashes the request.
+  .get('/balance/:chain/:address', async ({ params, query }) => {
+    if (query.token) return tokenBalance(params.chain, params.address, query.token)
+    const domain = knownChain(params.chain).domain
+    if (domain === undefined) throw new HttpError(400, 'Name a token.')
+    return balance(domain, params.address)
+  }, {
+    params: t.Object({ chain: t.String({ maxLength: 64 }), address: t.String({ maxLength: 120 }) }),
+    query: t.Object({ token: t.Optional(t.String({ maxLength: 200 })) }),
+  })
+  .get('/tokens/:chain', ({ params, query }) => tokens(params.chain, query.q), {
+    params: t.Object({ chain: t.String({ maxLength: 64 }) }),
+    query: t.Object({ q: t.Optional(t.String({ maxLength: 200 })) }),
+  })
+  // Routes from the other bridges, best first. CCTP itself is quoted by /fees.
+  .post('/quotes', ({ body }) => quotes(quoteRequest(body), body.providers as ProviderId[] | undefined), {
+    body: t.Object({
+      from: chainRef,
+      to: chainRef,
+      fromToken: t.String({ maxLength: 200 }),
+      toToken: t.String({ maxLength: 200 }),
+      amount: t.String({ maxLength: 40 }),
+      sender: t.Optional(t.String({ maxLength: 120 })),
+      recipient: t.Optional(t.String({ maxLength: 120 })),
+      addresses: t.Optional(t.Record(t.String({ maxLength: 64 }), t.String({ maxLength: 120 }))),
+      slippageBps: t.Optional(t.Integer()),
+      providers: t.Optional(t.Array(t.String(), { maxItems: 10 })),
+    }),
+  })
+  .post('/quotes/status', ({ body }) => routeStatus(body.provider, body), {
+    body: t.Object({ provider: t.String(), txHash: t.String({ maxLength: 120 }), from: chainRef, to: chainRef, track: t.Record(t.String(), t.String()) }),
+  })
+  // Sending from a Cosmos chain: the transaction to sign (see ./cosmos.ts), then the signed one to broadcast.
+  .post('/cosmos/prepare', async ({ body }) => prepare({ ...body, chain: knownChain(body.chain) }), {
+    body: t.Object({
+      chain: t.String({ maxLength: 64 }),
+      signer: t.String({ maxLength: 120 }),
+      pubKey: t.String({ maxLength: 100 }),
+      algo: t.Optional(t.String({ maxLength: 20 })),
+      messages: t.Array(t.Object({ typeUrl: t.String({ maxLength: 200 }), value: t.String({ maxLength: 100_000 }) }), { minItems: 1, maxItems: 10 }),
+      memo: t.Optional(t.String({ maxLength: 512 })),
+    }),
+  })
+  .post('/cosmos/broadcast', async ({ body }) => broadcast({ ...body, chain: knownChain(body.chain) }), {
+    body: t.Object({
+      chain: t.String({ maxLength: 64 }),
+      bodyBytes: t.String({ maxLength: 200_000 }),
+      authInfoBytes: t.String({ maxLength: 10_000 }),
+      signature: t.String({ maxLength: 200 }),
+    }),
+  })
+  .get('/cosmos/tx/:chain/:hash', async ({ params }) => txStatus(knownChain(params.chain), params.hash), {
+    params: t.Object({ chain: t.String({ maxLength: 64 }), hash: t.String({ pattern: '^[0-9A-Fa-f]{64}$' }) }),
   })
   .get('/address/:address', ({ params }) => lookupAddress(params.address))
   .get('/history/:address', ({ params, query }) => history(params.address, query.offset), {
@@ -143,5 +255,7 @@ const app = new Elysia()
 startIndexer()
 void autoRedeem()
 void resumeSwaps()
-console.log(`Injective CCTP bridge API (${network}) on http://localhost:${app.server?.port}`)
+// The token lists most people open, loaded ahead: the CCTP chains', then the main Cosmos chains'.
+void ready.then(() => warmTokens([...allChains().filter((c) => c.domain !== undefined), ...['injective-cosmos', 'osmosis', 'cosmoshub', 'noble'].flatMap((id) => chainById(id) ?? [])]))
+console.log(`Lahn Bridge API (${network}) on http://localhost:${app.server?.port}`)
 console.log(`Relayer: ${relayer?.account.address ?? 'disabled (set RELAYER_PRIVATE_KEY)'} · indexing ${chains.length} chains`)

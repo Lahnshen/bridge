@@ -25,6 +25,7 @@ export function forwardHook(setupFor?: Hex): Hex {
 export const encode = {
   approve: (spender: Hex, amount: bigint): Hex => `0x095ea7b3${address(spender)}${word(amount)}`,
   allowance: (owner: Hex, spender: Hex): Hex => `0xdd62ed3e${address(owner)}${address(spender)}`,
+  balanceOf: (owner: Hex): Hex => `0x70a08231${address(owner)}`,
   // TokenMessengerV2
   depositForBurn: (b: Burn): Hex => `0x8e0250ee${burnArgs(b)}`,
   depositForBurnWithHook: (b: Burn, hookData: Hex): Hex => `0x779b432d${burnArgs(b)}${word(8 * 32)}${bytes(hookData)}`,
@@ -58,6 +59,26 @@ export function formatUsdc(units: bigint, decimals = 2) {
 export const formatAmount = (amount?: string, decimals = 2) => {
   const units = amount === undefined ? undefined : parseUsdc(amount)
   return units === undefined ? '—' : formatUsdc(units, decimals)
+}
+
+// ---- Any token's amounts ----------------------------------------------------------------------------
+
+export function parseAmount(value: string, decimals: number): bigint | undefined {
+  const match = /^(\d*)\.?(\d*)$/.exec(value)
+  if (!match || !/\d/.test(value) || match[2]!.length > decimals) return
+  return BigInt(match[1] || '0') * 10n ** BigInt(decimals) + BigInt(match[2]!.padEnd(decimals, '0') || '0')
+}
+
+export function amountString(units: bigint, decimals: number) {
+  const base = 10n ** BigInt(decimals)
+  const fraction = (units % base).toString().padStart(decimals, '0').replace(/0+$/, '')
+  return `${units / base}${fraction ? `.${fraction}` : ''}`
+}
+
+// For display: 2 decimals from 1,000 up, 6 significant digits below.
+export function formatToken(units: bigint, decimals: number) {
+  const n = Number(amountString(units, decimals))
+  return n.toLocaleString('en-US', n >= 1000 ? { maximumFractionDigits: 2 } : { maximumSignificantDigits: 6 })
 }
 
 // ---- Addresses ------------------------------------------------------------------------------------

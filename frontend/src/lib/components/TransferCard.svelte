@@ -6,7 +6,7 @@
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
   import { INJECTIVE, redeem, SOLANA, type EvmChain, type Transfer } from '$lib/api'
-  import { app, chainOf, navigate } from '$lib/app.svelte'
+  import { app, chainFor, navigate, txLink } from '$lib/app.svelte'
   import { encode, formatAmount, short } from '$lib/evm'
   import { solanaAddress } from '$lib/solana'
   import type { Recent } from '$lib/transfers.svelte'
@@ -18,11 +18,11 @@
 
   const local = $derived('createdAt' in item ? item : undefined)
   const t = $derived(local ? local.transfer : (item as Transfer))
-  const source = $derived(chainOf(item.sourceDomain))
-  const destination = $derived(chainOf(item.destinationDomain))
+  const source = $derived(chainFor(local?.from, item.sourceDomain))
+  const destination = $derived(chainFor(local?.to, item.destinationDomain))
   const sourceName = $derived(t?.sourceChain ?? source?.name ?? `Domain ${item.sourceDomain}`)
   const destinationName = $derived(t?.destinationChain ?? destination?.name ?? `Domain ${item.destinationDomain}`)
-  const sourceUrl = $derived(t?.txUrl ?? (source?.explorer && item.txHash && `${source.explorer}/tx/${item.txHash}`))
+  const sourceUrl = $derived(t?.txUrl ?? txLink(source, item.txHash))
   // Solana recipients are 32-byte keys (the USDC account), shown the way Solana shows them.
   const recipient = $derived(t?.recipient && item.destinationDomain === SOLANA && /^0x[0-9a-f]{64}$/i.test(t.recipient) ? solanaAddress(t.recipient) : t?.recipient)
   const sent = $derived(t?.time && new Date(t.time * 1000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
@@ -63,7 +63,7 @@
     busy = item.status === 'pending' ? 'Queuing…' : 'Redeeming…'
     error = ''
     try {
-      const { transfers } = await redeem(item.txHash, item.sourceDomain)
+      const { transfers } = await redeem(item.txHash, item.sourceDomain!)
       handedOver = true
       const updated = transfers.find((x) => x.nonce === t?.nonce) ?? transfers[0]
       if (updated) onupdate(updated)
@@ -88,7 +88,7 @@
       const hash = await sendTx(chain, { to: app.config!.messageTransmitter, data }, { padGas: chain.domain === INJECTIVE })
       busy = 'Claiming…'
       if (!(await waitForReceipt(hash))) throw new Error('The claim transaction failed.')
-      const redeemTxUrl = chain.explorer && `${chain.explorer}/tx/${hash}`
+      const redeemTxUrl = txLink(chain, hash)
       onupdate({ ...t!, status: 'redeemed', note: undefined, message: undefined, attestation: undefined, redeemTx: hash, redeemTxUrl })
     } catch (err) {
       error = walletError(err) ?? ''
@@ -101,8 +101,8 @@
 <article class="bg-card rounded-lg border shadow-xs">
   <header class="flex items-center gap-3 px-4 pt-4">
     <span class="flex shrink-0 -space-x-1.5">
-      <ChainIcon domain={item.sourceDomain} name={sourceName} class="ring-card size-6 text-[11px] ring-2" />
-      <ChainIcon domain={item.destinationDomain} name={destinationName} class="ring-card size-6 text-[11px] ring-2" />
+      <ChainIcon chain={source ?? { id: '', name: sourceName }} class="ring-card size-6 text-[11px] ring-2" />
+      <ChainIcon chain={destination ?? { id: '', name: destinationName }} class="ring-card size-6 text-[11px] ring-2" />
     </span>
     <div class="min-w-0 flex-1">
       <p class="text-[15px] leading-tight font-semibold tracking-tight tabular-nums">{formatAmount(t?.amount ?? local?.amount)} USDC</p>

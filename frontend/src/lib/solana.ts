@@ -241,7 +241,14 @@ export async function burnOnSolana(chain: SolanaChain, owner: string, burn: Sola
   tx.set(signature, start + 64 * slot)
 
   step('Sending…')
-  const encoded = btoa(String.fromCharCode(...tx))
+  return sendSigned(tx)
+}
+
+// Sends a signed transaction and keeps resending it in the background until it lands. Returns its signature.
+export async function sendSigned(tx: Uint8Array) {
+  let binary = ''
+  for (const byte of tx) binary += String.fromCharCode(byte)
+  const encoded = btoa(binary)
   const id = await rpc<string>('sendTransaction', [encoded, { encoding: 'base64', preflightCommitment: 'confirmed' }])
   void confirm(id, encoded)
   return id

@@ -78,10 +78,11 @@ const evmChains: [number, string, Chain, Hex, Chain?, Hex?][] = [
 const otherDomains: Record<number, string> = { 5: 'Solana', 8: 'Sui', 9: 'Aptos', 25: 'Starknet', 27: 'Stellar' }
 
 // RPC_<NAME> overrides the public RPC, e.g. RPC_ETHEREUM or RPC_OP_MAINNET. Comma-separate several URLs for fallback.
-const rpcEnv = (name: string) => `RPC_${name.toUpperCase().replace(/\W+/g, '_')}`
-function transport(rpcEnv: string) {
+export const rpcEnv = (name: string) => `RPC_${name.toUpperCase().replace(/\W+/g, '_')}`
+// The RPCs in that variable, else publicRpc (else the chain's default in viem).
+export function transport(rpcEnv: string, publicRpc?: string) {
   const urls = env[rpcEnv]?.split(',').map((u) => u.trim()).filter(Boolean) ?? []
-  const transports = (urls.length ? urls : [undefined]).map((url) => http(url, { timeout: 10_000, retryCount: 1 }))
+  const transports = (urls.length ? urls : [publicRpc]).map((url) => http(url, { timeout: 10_000, retryCount: 1 }))
   return transports.length > 1 ? fallback(transports) : transports[0]!
 }
 
@@ -109,6 +110,13 @@ export const solana = {
   tokenMessenger: 'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe', // TokenMessengerMinterV2
   messageTransmitter: 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
   explorer: 'https://solscan.io',
+}
+
+// Each CCTP chain's id in links and in the chain list (/chains networks), by domain.
+export const SLUGS: Record<number, string> = {
+  0: 'ethereum', 1: 'avalanche', 2: 'optimism', 3: 'arbitrum', 5: 'solana', 6: 'base', 7: 'polygon', 10: 'unichain', 11: 'linea', 12: 'codex',
+  13: 'sonic', 14: 'worldchain', 15: 'monad', 16: 'sei', 18: 'xdc', 19: 'hyperevm', 21: 'ink', 22: 'plume', 25: 'starknet', 26: 'arc',
+  27: 'stellar', 28: 'edge', 29: 'injective', 30: 'morph', 31: 'pharos', 32: 'cronos', 33: 'plasma', 37: 'xlayer',
 }
 
 export const domainName = (domain: number) => chainOf(domain)?.name ?? (domain === SOLANA_DOMAIN ? solana.name : otherDomains[domain])

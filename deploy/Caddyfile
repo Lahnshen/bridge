@@ -22,7 +22,7 @@
 
 	# UI: the built frontend
 	handle {
-		root * /opt/inj-cctp-redeemer/frontend/dist
+		root * /opt/bridge/frontend/dist
 		try_files {path} /index.html
 		file_server
 	}

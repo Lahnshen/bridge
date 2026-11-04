@@ -1,11 +1,11 @@
 [Unit]
-Description=Injective CCTP redeemer API
+Description=Lahn Bridge API
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=deploy
-WorkingDirectory=/opt/inj-cctp-redeemer/backend
+WorkingDirectory=/opt/bridge/backend
 # Bun loads backend/.env from the working directory.
 ExecStart=/home/deploy/.bun/bin/bun src/index.ts
 Restart=always

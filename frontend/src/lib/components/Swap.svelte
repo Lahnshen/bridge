@@ -9,6 +9,7 @@
   import { getBalance, getSwapQuote, INJECTIVE, swap, type Hex, type SwapQuote, type SwapResult } from '$lib/api'
   import { app, injective } from '$lib/app.svelte'
   import { formatUsdc, parseUsdc, usdcString } from '$lib/evm'
+  import { acceptTerms } from '$lib/terms.svelte'
   import { connectWallet, signTypedData, switchChain, wallet, walletError } from '$lib/wallet.svelte'
 
   // USDC on Injective to INJ for gas. The wallet only signs a message (an EIP-3009 authorization to move the USDC);
@@ -81,6 +82,7 @@
 
   async function submit() {
     if (!wallet.address) return connectWallet()
+    if (!(await acceptTerms())) return
     const from = wallet.address
     error = ''
     try {

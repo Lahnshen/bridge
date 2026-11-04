@@ -1,5 +1,5 @@
 {
-  "name": "inj-cctp-redeemer-backend",
+  "name": "bridge-backend",
   "private": true,
   "type": "module",
   "scripts": {

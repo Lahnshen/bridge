@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "inj-cctp-redeemer-backend",
+      "name": "bridge-backend",
       "dependencies": {
         "elysia": "^1.4.30",
         "viem": "^2.57.3",

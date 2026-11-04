@@ -6,6 +6,8 @@ export PATH="$HOME/.bun/bin:$PATH"
 cd "$(dirname "$0")/.."
 
 git pull --ff-only
+# Bash keeps running the copy of this script it started with, so run the one just pulled.
+if [ -z "${DEPLOY_PULLED:-}" ]; then DEPLOY_PULLED=1 exec deploy/deploy.sh; fi
 (cd backend && bun install --frozen-lockfile --production)
 (cd frontend && bun install --frozen-lockfile && VITE_API_URL=/api bun --bun run build) # --bun: no Node.js needed
 sudo systemctl restart bridge

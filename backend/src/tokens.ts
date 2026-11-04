@@ -1,6 +1,6 @@
 import { erc20Abi, getAddress, isAddress, type Hex } from 'viem'
 import { HttpError } from './cctp'
-import { addressOnSide, chainById, evmClient, HYPERLIQUID_API, NATIVE, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
+import { addressOnSide, chainById, evmClient, ready, HYPERLIQUID_API, NATIVE, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
 import { cosmosBalance } from './cosmos'
 import { publicKey, solanaRpc } from './solana'
 
@@ -137,11 +137,14 @@ function basics(chain: ChainInfo): Listed[] {
 
 // Each chain's list, loaded on first use. One that fails is asked again after a minute.
 const catalogs = new Map<string, { at: number; ttl: number; list: Promise<Token[]> }>()
-function catalog(chain: ChainInfo): Promise<Token[]> {
-  const hit = catalogs.get(chain.id)
+function catalog(asked: ChainInfo): Promise<Token[]> {
+  const hit = catalogs.get(asked.id)
   if (hit && Date.now() - hit.at < hit.ttl) return hit.list
   const entry = { at: Date.now(), ttl: 6 * 3600_000, list: Promise.resolve([] as Token[]) }
   entry.list = (async () => {
+    // Until the bridges' chain lists load (a few seconds after start), a chain has none of their ids, so no token list.
+    await ready
+    const chain = chainById(asked.id) ?? asked
     const loader = chain.tokens && chain.tokens in LOADERS ? LOADERS[chain.tokens as keyof typeof LOADERS] : undefined
     const listed = loader
       ? await loader(chain).catch((err) => {
@@ -159,7 +162,7 @@ function catalog(chain: ChainInfo): Promise<Token[]> {
     const list = [...base, ...own.filter((t) => !base.some((b) => sameAddress(b.address, t.address)))].map((t) => ({ chain: chain.id, ...t }))
     return chain.cosmosSide ? sideTokens(chain, list).catch(() => ((entry.ttl = 60_000), list)) : list
   })()
-  catalogs.set(chain.id, entry)
+  catalogs.set(asked.id, entry)
   return entry.list
 }
 
@@ -193,6 +196,7 @@ async function sideTokens(chain: ChainInfo, list: Token[]) {
   const side = chainById(chain.cosmosSide!)
   if (!side) return list
   const [theirs, pairs] = await Promise.all([catalog(side), tokenPairs(side)])
+  if (!theirs.length) throw new Error('no Cosmos side tokens') // asked again in a minute, like a failed list
   const merged = [...list]
   for (const t of theirs) {
     if (side.native && t.address === side.native.address) continue // INJ: the EVM side's gas token

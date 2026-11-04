@@ -5,6 +5,7 @@
   import InfoIcon from '@lucide/svelte/icons/info'
   import PencilIcon from '@lucide/svelte/icons/pencil'
   import XIcon from '@lucide/svelte/icons/x'
+  import { tick } from 'svelte'
   import { fade, slide } from 'svelte/transition'
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
@@ -169,6 +170,13 @@
   function resetRecipient() {
     recipientText = ''
     editingRecipient = false
+  }
+  // Opens the recipient field with the cursor in it. Browsers skip autofocus once something on the page has focus.
+  let recipientInput = $state<HTMLInputElement>()
+  async function editRecipient() {
+    editingRecipient = true
+    await tick()
+    recipientInput?.focus()
   }
 
   // Routes to Injective for first-time visitors, gone once they pick a route.
@@ -457,7 +465,11 @@
     const price = isUsdc(token) ? 1 : token.priceUsd
     return price === undefined ? undefined : (Number(value) / 10 ** token.decimals) * price
   }
-  const usdValue = $derived.by((): { in?: number; out?: number; change?: number } => {
+  type Worth = { in?: number; out?: number; change?: number }
+  // Under a cent, prices and pools round too much for a change to mean anything (dust can "gain" 500%).
+  const meaningful = (w: Worth): Worth => (w.in! >= 0.01 && w.out! >= 0.01 ? w : { ...w, change: undefined })
+  const usdValue = $derived(meaningful(priced()))
+  function priced(): Worth {
     const [sent, out] = [amount ? worth(amount, fromToken) : undefined, selected ? worth(selected.out, toToken) : undefined]
     if (isUsdc(fromToken) && isUsdc(toToken)) return { in: sent, out, change: sent && out ? out / sent - 1 : undefined }
     const q = selectedQuote
@@ -468,7 +480,7 @@
       return { in: other.usdIn, out: scaled, change: scaled / other.usdIn! - 1 }
     }
     return { in: sent, out }
-  })
+  }
   const percent = (change: number) => `${change < 0 ? '−' : '+'}${Math.abs(change * 100).toFixed(2)}%`
 
   const problem = $derived.by(() => {
@@ -523,7 +535,7 @@
 
   async function submit() {
     if (!sender) return connectFor(source)
-    if (askRecipient) return void (editingRecipient = true)
+    if (askRecipient) return editRecipient()
     if (!(await acceptTerms())) return
     chosen = true // sending with the suggested route picks it too
     return selected?.id === 'cctp' ? submitCctp() : submitRoute(selected!)
@@ -869,14 +881,13 @@
       </div>
       <div class="text-muted-foreground mt-2 flex h-4 items-center gap-1.5 text-xs">
         {#if editingRecipient}
-          <!-- svelte-ignore a11y_autofocus -->
           <input
+            bind:this={recipientInput}
             class={['min-w-0 flex-1 bg-transparent font-mono outline-none placeholder:font-sans', recipientText.trim() && !recipient ? 'text-destructive' : 'text-foreground']}
             placeholder="Recipient {addressHint(destination)} address"
             aria-label="Recipient address"
             autocomplete="off"
             spellcheck="false"
-            autofocus
             disabled={!!busy}
             bind:value={recipientText}
           />
@@ -890,11 +901,11 @@
           {:else if walletKind(destination) && walletKind(destination) === walletKind(source) && !sender}
             <span class="text-foreground/80">your wallet</span>
           {:else}
-            <button type="button" class="text-foreground/80 hover:text-foreground underline-offset-2 hover:underline" disabled={!!busy} onclick={() => (editingRecipient = true)}>
+            <button type="button" class="text-foreground/80 hover:text-foreground underline-offset-2 hover:underline" disabled={!!busy} onclick={editRecipient}>
               add a {destination.name} address
             </button>
           {/if}
-          <button type="button" class="hover:text-foreground p-0.5 transition-colors" aria-label="Change recipient" disabled={!!busy} onclick={() => (editingRecipient = true)}>
+          <button type="button" class="hover:text-foreground p-0.5 transition-colors" aria-label="Change recipient" disabled={!!busy} onclick={editRecipient}>
             <PencilIcon class="size-3" />
           </button>
           {#if !recipientValue && walletKind(destination) && (sender || walletKind(destination) !== walletKind(source))}

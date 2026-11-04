@@ -22,7 +22,7 @@
   const KINDS = {
     evm: { title: 'Connect a wallet', install: 'MetaMask or Rabby' },
     solana: { title: 'Connect a Solana wallet', install: 'Phantom or Solflare' },
-    cosmos: { title: 'Connect a Cosmos wallet', install: 'Keplr or Leap' },
+    cosmos: { title: 'Connect a Cosmos wallet', install: 'Keplr' },
   }
   const kind = $derived(wallet.picking || 'evm')
   const options = $derived(kind === 'solana' ? solanaWallet.available : kind === 'cosmos' ? cosmosWallet.available : wallet.available)

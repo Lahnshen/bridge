@@ -2,9 +2,8 @@ import type { Chain, CosmosChain, PreparedTx } from './api'
 import { bech32Decode, bech32Encode } from './bech32'
 import { wallet, type WalletInfo } from './wallet.svelte'
 
-// Cosmos wallets with Keplr's API: Keplr (window.keplr), Leap (window.leap) and Cosmostation (its Keplr-compatible
-// provider). A chain is enabled (the wallet asks the user once) before its key is read; a chain the wallet doesn't know is
-// suggested to it from the chain registry. Transactions are built by the server and signed here with SIGN_MODE_DIRECT.
+// The Cosmos wallet: Keplr (window.keplr). A chain is enabled (the wallet asks the user once) before its key is read; a
+// chain the wallet doesn't know is suggested to it from the chain registry. Transactions are built by the server and signed here with SIGN_MODE_DIRECT.
 
 type Key = { algo: string; pubKey: Uint8Array; bech32Address: string; isNanoLedger?: boolean }
 type SignDoc = { bodyBytes: Uint8Array; authInfoBytes: Uint8Array; chainId: string; accountNumber: unknown }
@@ -17,8 +16,6 @@ type Provider = {
 
 const SOURCES: (WalletInfo & { get: () => Provider | undefined })[] = [
   { id: 'keplr', name: 'Keplr', get: () => (window as { keplr?: Provider }).keplr },
-  { id: 'leap', name: 'Leap', get: () => (window as { leap?: Provider }).leap },
-  { id: 'cosmostation', name: 'Cosmostation', get: () => (window as { cosmostation?: { providers?: { keplr?: Provider } } }).cosmostation?.providers?.keplr },
 ]
 const STORAGE_KEY = 'cosmos-wallet'
 

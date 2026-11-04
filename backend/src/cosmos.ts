@@ -3,7 +3,7 @@ import type { ChainInfo } from './chains'
 import { rpcEnv } from './config'
 
 // Sending from Cosmos chains. The server builds each transaction (protobuf, SIGN_MODE_DIRECT) and broadcasts it, so the
-// page only asks the wallet (Keplr, Leap, Cosmostation) to sign. Chains are reached over REST: cosmos.directory's
+// page only asks the wallet (Keplr) to sign. Chains are reached over REST: cosmos.directory's
 // proxy or a node from the chain registry, else REST_<ID> (e.g. REST_OSMOSIS), comma-separated for fallback.
 
 // ---- Protocol Buffers, as much as these messages need ------------------------------------------------

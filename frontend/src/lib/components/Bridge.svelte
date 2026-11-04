@@ -615,7 +615,7 @@
   async function cosmosSigner(side: CosmosChain) {
     if (!cosmosWallet.connected) {
       void connectCosmosWallet(side)
-      throw new Error(`This route starts on ${side.name}'s Cosmos side: connect Keplr, Leap or Cosmostation, then send again.`)
+      throw new Error(`This route starts on ${side.name}'s Cosmos side: connect a Cosmos wallet like Keplr, then send again.`)
     }
     busy = `Getting your ${side.name} address…`
     return cosmosWallet.addresses[side.id] ?? (await addressFromWallet(side))

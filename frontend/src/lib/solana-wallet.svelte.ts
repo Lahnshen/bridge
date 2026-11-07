@@ -107,8 +107,18 @@ export async function solanaIsOn(address: string) {
   solanaWallet.address = address
   return true
 }
-// The wallet app an account is in, by name.
-export const solanaWalletOf = (address: string) => solanaWallet.accounts.find((a) => a.address === address)?.wallet
+// The wallet app an account is in.
+export const solanaWalletOf = (address: string) => solanaWallet.available.find((w) => w.id === solanaWallet.accounts.find((a) => a.address === address)?.wallet)
+
+// Has the wallet connect the account it's on, which it may ask about (one switched to there isn't connected to this site
+// yet, and can't be without a prompt); resolves to whether it's this one.
+export async function chooseSolanaAccount(address: string) {
+  if (await solanaIsOn(address)) return true
+  const id = solanaWallet.accounts.find((a) => a.address === address)?.wallet ?? solanaWallet.connected?.id
+  if (!id || !wallets.has(id)) throw new Error('Open the wallet this account is in, then try again.')
+  await connectSolana(id)
+  return solanaIsOn(address)
+}
 
 // The wallet signs a serialized transaction (without sending it), and returns it with its signature added.
 export async function signSolanaTransaction(transaction: Uint8Array, devnet = false): Promise<Uint8Array> {

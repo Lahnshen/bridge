@@ -27,6 +27,10 @@ export type Tx = 'swap' | 'bridge' | 'cctp'
 const UNITS: Record<Tx, bigint> = { swap: 300_000n, bridge: 150_000n, cctp: 120_000n }
 const APPROVE = 50_000n
 const LAMPORTS: Record<Tx, bigint> = { swap: 2_000_000n, bridge: 500_000n, cctp: 3_000_000n }
+// On Cosmos chains, the gas limit a transaction is sent with (see ./cosmos.ts: half again what it simulated): a swap
+// through Skip's contracts is a CosmWasm call, 0.75–1.9M gas used on Injective's Cosmos side (Nov 2026); a transfer or
+// a burn far less.
+const COSMOS_GAS: Record<Tx, number> = { swap: 3_000_000, bridge: 450_000, cctp: 450_000 }
 // OP Stack chains add an L1 data fee to each transaction: ~1.5e-8 ETH in Nov 2026, allowed for at 1e-7.
 const OP_STACK = new Set([10, 8453, 130, 480, 57073, 1868, 34443, 7777777, 1135, 81457, 252, 5330, 60808, 360])
 const L1_FEE = 100_000_000_000n
@@ -51,7 +55,7 @@ export function txCost(chain: ChainInfo, tx: Tx, erc20: boolean, gasPriceWei?: b
   if (chain.kind === 'solana') return LAMPORTS[tx]
   if (chain.kind === 'cosmos') {
     const price = Number(chain.gas?.price)
-    return price > 0 ? BigInt(Math.ceil(300_000 * price * 1.5)) : undefined
+    return price > 0 ? BigInt(Math.ceil(COSMOS_GAS[tx] * price)) : undefined
   }
   if (gasPriceWei === undefined) return
   const approve = erc20 || tx === 'cctp'

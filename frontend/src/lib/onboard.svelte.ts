@@ -41,10 +41,10 @@ import { amountString, encode, formatToken, formatUsdc, forwardHook, parseUsdc, 
 import { getInj } from './get-inj'
 import { addressesFor, addressOn, addRouteRecent, cosmosSigner, RESET_FIRST, runSteps, sideOf } from './routes'
 import { accountExists, burnOnSolana, publicKey, solanaKeyHex, solanaMintRecipient, usdcAccount } from './solana'
-import { connectSolanaWallet, signSolanaTransaction, solanaIsOn, solanaWallet, solanaWalletOf } from './solana-wallet.svelte'
+import { chooseSolanaAccount, connectSolanaWallet, signSolanaTransaction, solanaIsOn, solanaWallet, solanaWalletOf } from './solana-wallet.svelte'
 import { acceptTerms } from './terms.svelte'
 import { addRecent, failRecent, recent, refresh, sentRecent, type Recent } from './transfers.svelte'
-import { call, connectWallet, isOn, sleep, switchChain, wallet, walletError, walletOf } from './wallet.svelte'
+import { call, chooseAccount, connectWallet, isOn, sleep, switchChain, wallet, walletError, walletOf, type WalletInfo } from './wallet.svelte'
 
 export { addressOn } from './routes'
 
@@ -137,7 +137,10 @@ export const onboard = $state({
   stopping: false,
   action: '', // what the wallet is asked for right now
   current: '', // the leg it's for
+  switching: undefined as Switching | undefined, // the run waits for the wallet to switch to this account
 })
+// The account the next leg sends from, and its wallet app, when the wallet is on another.
+export type Switching = { kind: 'evm' | 'solana'; address: string; wallet?: WalletInfo }
 
 // ---- One run, several tabs ---------------------------------------------------------------------------
 //
@@ -709,7 +712,8 @@ const chainName = (id: string) => chainById(id)?.name ?? id
 
 // The next legs to run: those of the account the wallet is on (so the user switches accounts as little as can be), else of
 // the first one ready. Of those, refuels first (the legs they pay gas for wait on them), then one chain at a time, the last
-// one's first, its swaps before the bridges they feed. A chain's swaps go together, for one batch where the wallet can.
+// one's first, its swaps before the bridges they feed, and the gas token's own last (the others' fees come out of it while
+// it's all there). A chain's swaps go together, for one batch where the wallet can.
 function pickNext(s: Session, last: string): Leg[] | undefined {
   const waiting = s.plan.legs.filter((l) => s.legs[l.id]?.status === 'waiting' && [...(l.after ?? []), ...(l.inputs ?? [])].every((id) => final(s.legs[id]?.status ?? 'done')))
   if (!waiting.length) return
@@ -718,7 +722,8 @@ function pickNext(s: Session, last: string): Leg[] | undefined {
   const refuel = ready.find((l) => l.purpose === 'refuel')
   if (refuel) return [refuel]
   const chain = ready.some((l) => l.from === last) ? last : ready[0]!.from
-  const here = ready.filter((l) => l.from === chain).sort((a, b) => ORDER[a.kind] - ORDER[b.kind])
+  const gas = (l: Leg) => Number(isNative(chainById(l.from)!, l.fromToken.address))
+  const here = ready.filter((l) => l.from === chain).sort((a, b) => ORDER[a.kind] - ORDER[b.kind] || gas(a) - gas(b))
   const first = here[0]!
   if (first.kind !== 'swap' || !onEvm(first) || chainById(chain)?.kind !== 'evm') return [first]
   return here.filter((l) => l.kind === 'swap' && onEvm(l)).slice(0, 8)
@@ -848,16 +853,36 @@ const signsNow = (s: Session, leg: Leg) => {
   return who === 'keplr' || (!!who && !!now && same(who, now))
 }
 
-// The wallet signs a leg from the account it sends from: on another one, the user is asked to switch to it there, and the
-// run waits (two minutes at most, or until stopped).
+// The wallet signs a leg from the account it sends from: on another one, the user is asked to switch to it there (or
+// to choose it, see chooseAccountNow), and the run waits (five minutes at most, or until stopped).
 async function onAccount(kind: 'evm' | 'solana', address: string) {
-  const until = Date.now() + 120_000
-  while (!(await (kind === 'evm' ? isOn(address) : solanaIsOn(address)))) {
-    if (onboard.stopping) throw new Hold('Paused. Continue when you’re ready.')
-    const name = (kind === 'evm' ? walletOf(address) : solanaWalletOf(address)) ?? 'your wallet'
-    if (Date.now() > until) throw new Error(`${name} stayed on another account. Switch it to ${short(address)}, then retry.`)
-    progress(`Switch ${name} to ${short(address)} to sign this step…`)
-    await sleep(1000)
+  const until = Date.now() + 300_000
+  try {
+    while (!(await (kind === 'evm' ? isOn(address) : solanaIsOn(address)))) {
+      if (onboard.stopping) throw new Hold('Paused. Continue when you’re ready.')
+      const name = (kind === 'evm' ? walletOf(address) : solanaWalletOf(address))?.name ?? 'your wallet'
+      if (Date.now() > until) throw new Error(`${name} stayed on another account. Switch it to ${short(address)}, then retry.`)
+      if (onboard.switching?.address !== address) onboard.switching = { kind, address, wallet: kind === 'evm' ? walletOf(address) : solanaWalletOf(address) }
+      progress(`Waiting for ${name} to switch to ${short(address)}…`)
+      await sleep(1000)
+    }
+  } finally {
+    onboard.switching = undefined
+  }
+}
+
+// The wallet asked for the account the run waits for (the run notices it's on it).
+export async function chooseAccountNow() {
+  const want = onboard.switching
+  if (!want) return
+  const [name, there] = [want.wallet?.name ?? 'Your wallet', `switch it to ${short(want.address)} there`]
+  try {
+    if (await (want.kind === 'evm' ? chooseAccount(want.address) : chooseSolanaAccount(want.address))) return
+    return `${name} is still on another account: ${there}.`
+  } catch (err) {
+    // Without the method (EIP-1193's 4200, JSON-RPC's -32601), only the wallet itself switches.
+    const code = (err as { code?: number })?.code
+    return code === 4200 || code === -32601 ? `${name} can’t be asked from here: ${there}.` : walletError(err)
   }
 }
 

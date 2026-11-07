@@ -502,7 +502,11 @@ function usdOf(ctx: Ctx, chain: ChainInfo, units?: bigint) {
   const price = ctx.prices.get(chain.id)
   return units === undefined || price === undefined ? undefined : (Number(units) / 10 ** nativeDecimals(ctx, chain)) * price
 }
-const costOfTx = (ctx: Ctx, chain: ChainInfo, tx: Tx, erc20: boolean) => txCost(chain, tx, erc20, ctx.gasPrices.get(chain.id))
+// On Injective's Cosmos side (side), the transaction is a Cosmos one: its gas, at that side's price, also in INJ.
+function costOfTx(ctx: Ctx, chain: ChainInfo, tx: Tx, erc20: boolean, side?: string) {
+  const cosmos = side && side === chain.cosmosSide ? chainById(side) : undefined
+  return cosmos ? txCost(cosmos, tx, erc20) : txCost(chain, tx, erc20, ctx.gasPrices.get(chain.id))
+}
 const isGas = (chain: ChainInfo, token: string) => {
   const gas = gasToken(chain)
   return !!gas && sameAddress(gas, token)
@@ -513,7 +517,7 @@ const txOf = (leg: Leg): Tx | undefined => (leg.kind === 'swap' ? 'swap' : leg.k
 // What a quote costs on top of what it delivers: what the bridge charges besides the amount, and the gas. Relay, LI.FI and
 // Across include the source gas in costUsd when they estimate it; for the others it's this plan's estimate.
 function costOf(ctx: Ctx, chain: ChainInfo, q: Quote, tx: Tx, erc20: boolean) {
-  const gas = usdOf(ctx, chain, costOfTx(ctx, chain, tx, erc20)) ?? 0
+  const gas = usdOf(ctx, chain, costOfTx(ctx, chain, tx, erc20, q.side)) ?? 0
   const native = q.costUsd === undefined && q.costNative ? (usdOf(ctx, chain, BigInt(q.costNative)) ?? 0) : 0
   const counted = (q.costUsd ?? 0) > 0 && (q.provider === 'relay' || q.provider === 'lifi' || q.provider === 'across')
   return (q.costUsd ?? 0) + native + (counted ? 0 : gas)
@@ -1096,7 +1100,7 @@ function gasNeed(ctx: Ctx, chain: ChainInfo, legs: Leg[]) {
   for (const leg of legs) {
     const tx = leg.from === chain.id ? txOf(leg) : undefined
     if (!tx) continue
-    const cost = costOfTx(ctx, chain, tx, !isGas(chain, leg.fromToken.address))
+    const cost = costOfTx(ctx, chain, tx, !isGas(chain, leg.fromToken.address), leg.side)
     if (cost === undefined) return
     need += cost
   }

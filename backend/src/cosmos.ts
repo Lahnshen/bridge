@@ -1,4 +1,4 @@
-import { hashTypedData, recoverPublicKey, type Hex } from 'viem'
+import { formatUnits, hashTypedData, recoverPublicKey, type Hex } from 'viem'
 import { publicKeyToAddress } from 'viem/accounts'
 import { bech32Decode } from './bech32'
 import { HttpError } from './cctp'
@@ -534,10 +534,20 @@ export async function broadcast({ chain, bodyBytes, authInfoBytes, signature, ty
   const tx = typedData ? await signedEip712(chain, base64Bytes(bodyBytes)!, typedData, signature, signer) : txRaw(base64Bytes(bodyBytes)!, base64Bytes(authInfoBytes)!, base64Bytes(signature)!)
   type Res = { tx_response: { txhash: string; code: number; raw_log?: string } }
   const { tx_response: r } = await rest<Res>(chain, '/cosmos/tx/v1beta1/txs', { tx_bytes: b64(tx), mode: 'BROADCAST_MODE_SYNC' }).catch((err) => {
-    throw err instanceof CosmosError ? new HttpError(400, simulationError(err.message)) : err
+    throw err instanceof CosmosError ? new HttpError(400, feeShortfall(chain, err.message) ?? simulationError(err.message)) : err
   })
-  if (r.code !== 0) throw new HttpError(400, simulationError(r.raw_log || `Rejected with code ${r.code}.`))
+  if (r.code !== 0) throw new HttpError(400, feeShortfall(chain, r.raw_log ?? '') ?? simulationError(r.raw_log || `Rejected with code ${r.code}.`))
   return { txHash: r.txhash }
+}
+
+// The node turned the transaction away for its fee, the only thing it takes before a block ("spendable balance
+// 1528746226563417inj is smaller than 1760000000000000inj"): what it takes and what the account has, in the gas token.
+function feeShortfall(chain: ChainInfo, message: string) {
+  const m = /spendable balance (\d+)(\S+?) is smaller than (\d+)(\S+?)(?=[:'"\s]|$)/.exec(message)
+  if (!m || m[2] !== m[4] || m[2] !== chain.gas?.denom) return
+  const symbol = chain.native?.symbol ?? m[2]
+  const show = (amount: string) => `${Number(formatUnits(BigInt(amount), chain.native?.decimals ?? 6)).toPrecision(2)} ${symbol}`
+  return `Not enough ${symbol} for the network fee: it takes ${show(m[3]!)}, and the account has ${show(m[1]!)}. Add a little ${symbol}, then retry.`
 }
 
 // An EIP-712 transaction, signed: the typed data is checked to be this transaction's, as the chain will rebuild it, and the

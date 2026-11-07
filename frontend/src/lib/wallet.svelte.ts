@@ -153,8 +153,30 @@ export async function isOn(address: string) {
   wallet.address = now
   return !!now && sameAddress(now, address)
 }
-// The wallet app an account is in, by name.
-export const walletOf = (address: string) => wallet.available.find((w) => w.id === wallet.accounts.find((a) => sameAddress(a.address, address))?.wallet)?.name
+// The wallet app an account is in.
+export const walletOf = (address: string) => wallet.available.find((w) => w.id === wallet.accounts.find((a) => sameAddress(a.address, address))?.wallet)
+
+// Has the wallet ask the user for the account this site uses, to put it on this one; resolves to whether it's on it.
+// MetaMask shows its account picker when asked for permissions. Rabby gives a site one account, picked only when it
+// connects: the site is disconnected there and connected again (closing that leaves it disconnected until asked again).
+// Elsewhere the user switches in the wallet. An account in another wallet app has that one connected.
+export async function chooseAccount(address: string) {
+  if (await isOn(address)) return true
+  const id = wallet.accounts.find((a) => sameAddress(a.address, address))?.wallet ?? wallet.connected?.id
+  const p = id && providers.get(id)
+  if (!id || !p) throw new Error('Open the wallet this account is in, then try again.')
+  if (p !== provider) await connect(id)
+  else if (id === 'io.rabby') {
+    await p.request({ method: 'wallet_revokePermissions', params: [{ eth_accounts: {} }] })
+    wallet.address = undefined
+    const list = (await p.request({ method: 'eth_requestAccounts' }).catch((err) => {
+      if (walletError(err) === undefined) throw new Error(`Closed without connecting: this site stays disconnected in ${wallet.connected?.name ?? 'Rabby'} until you choose an account again.`)
+      throw err
+    })) as Hex[] | undefined
+    wallet.address = list?.[0]
+  } else await p.request({ method: 'wallet_requestPermissions', params: [{ eth_accounts: {} }] })
+  return isOn(address)
+}
 
 // Any request to the connected wallet (batches use it, see batch.ts).
 export async function request(method: string, params?: unknown) {

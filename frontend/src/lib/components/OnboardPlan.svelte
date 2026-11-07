@@ -28,7 +28,9 @@
   import { formatToken, short } from '$lib/evm'
   import { ms } from '$lib/motion'
   import { walletKind } from '$lib/address'
-  import { begin, cancelPlan, confirmations, dismiss, finished, isMine, onboard, ownOn, retry, run, skip, stop, walletFor, type LegRun, type Session, type Target } from '$lib/onboard.svelte'
+  import { begin, cancelPlan, chooseAccountNow, confirmations, dismiss, finished, isMine, onboard, ownOn, retry, run, skip, stop, walletFor, type LegRun, type Session, type Target } from '$lib/onboard.svelte'
+  import { solanaWallet } from '$lib/solana-wallet.svelte'
+  import { wallet } from '$lib/wallet.svelte'
   import { duration, providerLogo, usd } from '$lib/routes'
   import ChainIcon from './ChainIcon.svelte'
   import TokenIcon from './TokenIcon.svelte'
@@ -105,6 +107,29 @@
   const via = (leg: Leg) => [leg.name, leg.via?.replace(/\s*\(.*\)$/, ''), session && duration(leg.seconds)].filter(Boolean).join(' · ')
   // A transfer to another chain opens in the Bridge tab, which follows it; a swap links to the explorer.
   const link = (leg: Leg, r?: LegRun) => (r?.txHash && !r.recentKey && leg.kind === 'swap' ? txLink(chainById(leg.from), r.txHash) : undefined)
+  // The run waits for the wallet to switch accounts: the account it's on now, and the wallet asked for the one it waits for.
+  const switching = $derived(onboard.running ? onboard.switching : undefined)
+  const switchName = $derived(switching?.wallet?.name ?? 'your wallet')
+  const switchFrom = $derived(switching && (switching.kind === 'evm' ? wallet.address : solanaWallet.address))
+  let choosing = $state(false)
+  let chooseError = $state<string>()
+  let copied = $state(false)
+  // What the wallet said about an account goes with it.
+  const switchTo = $derived(switching?.address)
+  $effect(() => {
+    void switchTo
+    chooseError = undefined
+  })
+  async function choose() {
+    choosing = true
+    chooseError = undefined
+    chooseError = await chooseAccountNow().finally(() => (choosing = false))
+  }
+  async function copy(address: string) {
+    await navigator.clipboard.writeText(address).catch(() => {})
+    copied = true
+    setTimeout(() => (copied = false), 1500)
+  }
   const GAS: Record<Plan['gas']['kind'], string> = { none: 'Not added', 'has-gas': 'You have gas there', stable: 'Paid in the stable', 'get-inj': 'Get INJ, gas free', topup: 'Added to a transfer', leg: 'A small transfer', unavailable: 'Not planned' }
 </script>
 
@@ -303,6 +328,37 @@
     Each step is quoted again before you sign it, and stops if the price got more than 0.5% worse. Exact approvals only.
   </p>
 {:else if onboard.running || onboard.elsewhere}
+  <!-- Until the wallet is on the account the next step sends from, nothing happens there: this says so where it stays in
+       view, and what to do. -->
+  {#if switching}
+    <div class="bg-card border-primary/60 ring-primary/15 sticky bottom-3 z-10 mt-4 rounded-lg border p-3.5 shadow-lg ring-4" role="status" in:fade={{ duration: ms(120) }}>
+      <div class="flex items-start gap-3">
+        {#if switching.wallet?.icon}<img src={switching.wallet.icon} alt="" class="size-8 shrink-0 rounded-lg" />{/if}
+        <div class="min-w-0 flex-1">
+          <p class="text-[13px] leading-tight font-medium">
+            Switch {switchName} to <span class="font-mono" title={switching.address}>{short(switching.address)}</span>
+          </p>
+          <p class="text-muted-foreground mt-1.5 text-xs leading-relaxed">
+            The next step sends from this account{switchFrom ? `, and ${switchName} is on ${short(switchFrom)}` : ''}. Once it switches, the run goes on and {switchName} asks you to sign.
+          </p>
+          {#if switching.wallet?.id === 'io.rabby'}
+            <p class="text-muted-foreground mt-1.5 text-xs leading-relaxed">
+              In Rabby, switch on this site's row at the bottom of its window: with “Switch Dapp Address Independently” on, the main address doesn't change this site's. Or choose it here, and Rabby asks to connect this site again with the address to pick.
+            </p>
+          {:else if switching.kind === 'solana'}
+            <p class="text-muted-foreground mt-1.5 text-xs leading-relaxed">An account this site wasn't connected to has to be connected first: Connect asks {switchName} to.</p>
+          {/if}
+          <div class="mt-3 flex flex-wrap items-center gap-2">
+            <Button size="sm" class="px-3.5" disabled={choosing} onclick={choose}>
+              {#if choosing}<Spinner class="size-3.5" />{/if}{switching.kind === 'solana' ? 'Connect it' : `Choose it in ${switchName}`}
+            </Button>
+            <Button size="sm" variant="ghost" class="text-muted-foreground px-2.5" onclick={() => copy(switching.address)}>{copied ? 'Copied' : 'Copy address'}</Button>
+          </div>
+          {#if chooseError}<p class="text-destructive mt-2 text-xs leading-snug" transition:slide={{ duration: ms(150) }}>{chooseError}</p>{/if}
+        </div>
+      </div>
+    </div>
+  {/if}
   <!-- Another tab running it: this one only shows it. -->
   <div class="mt-4 flex items-center gap-3" in:fade={{ duration: ms(120) }}>
     <p class="text-muted-foreground flex min-w-0 flex-1 items-center gap-2 text-xs">

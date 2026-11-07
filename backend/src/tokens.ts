@@ -1,8 +1,9 @@
 import { erc20Abi, getAddress, isAddress, type Hex } from 'viem'
 import { HttpError } from './cctp'
-import { addressOnSide, chainById, evmClient, ready, HYPERLIQUID_API, NATIVE, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
+import { addressOnSide, chainById, evmClient, ready, HYPERLIQUID_API, NATIVE, ONE_CHAIN, resolveChain, sameAddress, SOL, USDT0_MESH, validAddress, type ChainInfo, type Source } from './chains'
 import { cosmosBalance } from './cosmos'
 import { publicKey, solanaRpc } from './solana'
+import { STABLES } from './stables'
 
 // Tokens the bridge can send and receive, per chain. Each chain's list comes from one bridge's catalog: LI.FI's where it
 // has the chain, else Skip's (Cosmos chains), Relay's, LayerZero's or deBridge's (see `tokens` in ../chains.ts). A list is
@@ -18,9 +19,13 @@ export type Token = {
   decimals: number
   logo?: string
   priceUsd?: number
-  verified: boolean // listed as verified, or the chain's gas token, CCTP USDC or USDT0
+  verified: boolean // listed as verified, or the chain's gas token, CCTP USDC, USDT0 or a canonical stable (./stables.ts)
 }
-type Listed = Omit<Token, 'chain'>
+// What the holdings scan also needs (see ./holdings.ts): LI.FI's market cap and 24 h volume, and Skip's CoinGecko id. They
+// stay out of the API's answers.
+export type Entry = Token & { mcap?: number; vol?: number; coingeckoId?: string }
+type Listed = Omit<Entry, 'chain'>
+export const publicToken = ({ mcap, vol, coingeckoId, ...token }: Entry): Token => token
 
 // Shown first, in this order. The chain's own gas token comes right after the stablecoins.
 const POPULAR = ['USDC', 'USDT', 'USDT0', '$native', 'ETH', 'WETH', 'WBTC', 'cbBTC', 'BTC', 'DAI', 'INJ', 'SOL', 'ATOM']
@@ -34,7 +39,17 @@ async function getList<T>(url: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>
 }
 
-type LifiToken = { address: string; symbol: string; name: string; decimals: number; logoURI?: string; priceUSD?: string; verificationStatus?: string }
+type LifiToken = {
+  address: string
+  symbol: string
+  name: string
+  decimals: number
+  logoURI?: string
+  priceUSD?: string
+  marketCapUSD?: number
+  volumeUSD24H?: number
+  verificationStatus?: string
+}
 type SkipAsset = {
   denom: string
   token_contract?: string
@@ -45,11 +60,13 @@ type SkipAsset = {
   logo_uri?: string
   origin_denom?: string
   origin_chain_id?: string
+  coingecko_id?: string
 }
 type RelayToken = { address: string; symbol: string; name: string; decimals: number; metadata?: { logoURI?: string; verified?: boolean } }
 type LzToken = { chainKey: string; address: string; symbol: string; name: string; decimals: number; icon?: string; price?: { usd?: number } }
 type DebridgeToken = { address: string; symbol: string; name: string; decimals: number; logoURI?: string }
 
+const usd = (value?: number | string) => (value == null || value === '' || !Number.isFinite(Number(value)) ? undefined : Number(value))
 const fromLifi = (t: LifiToken): Listed => ({
   address: t.address,
   symbol: t.symbol,
@@ -58,6 +75,8 @@ const fromLifi = (t: LifiToken): Listed => ({
   logo: t.logoURI?.trim() || undefined, // some end in a newline
   priceUsd: t.priceUSD ? Number(t.priceUSD) : undefined,
   verified: t.verificationStatus === 'verified',
+  mcap: usd(t.marketCapUSD),
+  vol: usd(t.volumeUSD24H),
 })
 
 // LayerZero lists every chain's tokens in one answer.
@@ -82,10 +101,10 @@ function skipSymbol(a: SkipAsset, chainId: string) {
   return a.origin_chain_id === 'noble-1' && a.origin_denom === 'uusdc' ? 'USDC' : symbol
 }
 
-const LOADERS: Record<Exclude<Source, 'across' | 'usdt0'>, (chain: ChainInfo) => Promise<Listed[]>> = {
+const LOADERS: Record<Exclude<Source, 'across' | 'usdt0' | 'orderbook'>, (chain: ChainInfo) => Promise<Listed[]>> = {
   lifi: async (chain) => {
     const id = String(chain.ids.lifi)
-    const { tokens } = await getList<{ tokens: Record<string, LifiToken[]> }>(`${LIFI}/tokens?chains=${id}&chainTypes=EVM,SVM,UTXO,MVM,TVM`, {
+    const { tokens } = await getList<{ tokens: Record<string, LifiToken[]> }>(`${LIFI}/tokens?chains=${id}&chainTypes=EVM,SVM,UTXO,MVM,TVM&extended=true`, {
       headers: auth('x-lifi-api-key', env.LIFI_API_KEY),
     })
     return (tokens[id] ?? []).filter((t) => t.verificationStatus !== 'flagged').map(fromLifi)
@@ -101,7 +120,7 @@ const LOADERS: Record<Exclude<Source, 'across' | 'usdt0'>, (chain: ChainInfo) =>
       const symbol = skipSymbol(a, id)
       if (!symbol || a.decimals === undefined) return []
       const address = chain.kind !== 'evm' ? a.denom : a.denom.endsWith('-native') ? NATIVE : (a.token_contract ?? a.denom)
-      return [{ address, symbol, name: a.name || symbol, decimals: a.decimals, logo: a.logo_uri, verified: true }]
+      return [{ address, symbol, name: a.name || symbol, decimals: a.decimals, logo: a.logo_uri, verified: true, coingeckoId: a.coingecko_id || undefined }]
     })
   },
   relay: async (chain) => {
@@ -122,25 +141,43 @@ const LOADERS: Record<Exclude<Source, 'across' | 'usdt0'>, (chain: ChainInfo) =>
   },
 }
 
-// Arc pays gas in USDC: its gas token and its USDC contract are the same money, so only the contract is listed.
+// Some gas tokens are an ERC20 too, the same balance either way: Arc's USDC, Stable's USDT0 (18 decimals as gas, 6 as the
+// contract) and Celo's CELO. Only the contract is listed, so nothing is counted twice or read in the wrong decimals.
+// Tempo has no gas token at all (fees are paid in USD stablecoins, and eth_getBalance answers a placeholder): none is listed.
+const CELO = '0x471EcE3750Da237f93B8E339c536989b8978a438'
 const gasIsUsdc = (chain: ChainInfo) => !!chain.usdc && chain.native?.symbol === 'USDC'
+// Where the chain's list has its gas token: its native address, else that contract (undefined on Tempo).
+export function gasToken(chain: ChainInfo): string | undefined {
+  if (chain.kind !== 'evm') return chain.native?.address
+  if (chain.chainId === 4217) return
+  if (chain.chainId === 42220) return CELO
+  if (chain.chainId === 988) return USDT0_MESH[988]?.token
+  return gasIsUsdc(chain) ? chain.usdc : chain.native?.address
+}
 
-// Every chain's gas token, CCTP USDC and USDT0, whatever the catalog says.
+// Every chain's gas token, CCTP USDC and USDT0, and its canonical stables (./stables.ts), whatever the catalog says.
 function basics(chain: ChainInfo): Listed[] {
   const usdt0 = chain.chainId ? USDT0_MESH[chain.chainId] : undefined
-  return [
+  const gas = gasToken(chain)
+  const { usdc, usdt } = STABLES[chain.id] ?? {}
+  const list: Listed[] = [
     ...(chain.usdc ? [{ address: chain.usdc, symbol: 'USDC', name: 'USD Coin', decimals: 6, verified: true }] : []),
     ...(usdt0 ? [{ address: usdt0.token, symbol: chain.chainId === 1 ? 'USDT' : 'USDT0', name: 'Tether USD', decimals: 6, verified: true }] : []),
-    ...(chain.native && !gasIsUsdc(chain) ? [{ ...chain.native, verified: true }] : []),
+    ...(chain.native && gas === chain.native.address ? [{ ...chain.native, verified: true }] : []),
+    ...(gas === CELO ? [{ address: CELO, symbol: 'CELO', name: 'Celo', decimals: 18, verified: true }] : []),
+    ...(usdc ? [{ address: usdc.address, symbol: 'USDC', name: 'USD Coin', decimals: usdc.decimals, verified: true }] : []),
+    ...(usdt ? [{ address: usdt.address, symbol: usdt.symbol.endsWith('0') ? 'USDT0' : 'USDT', name: 'Tether USD', decimals: usdt.decimals, verified: true }] : []),
   ]
+  return list.filter((t, i) => list.findIndex((o) => sameAddress(o.address, t.address)) === i)
 }
 
 // Each chain's list, loaded on first use. One that fails is asked again after a minute.
-const catalogs = new Map<string, { at: number; ttl: number; list: Promise<Token[]> }>()
-function catalog(asked: ChainInfo): Promise<Token[]> {
+const KEEP = 6 * 3600_000
+const catalogs = new Map<string, { at: number; ttl: number; list: Promise<Entry[]> }>()
+export function catalog(asked: ChainInfo): Promise<Entry[]> {
   const hit = catalogs.get(asked.id)
   if (hit && Date.now() - hit.at < hit.ttl) return hit.list
-  const entry = { at: Date.now(), ttl: 6 * 3600_000, list: Promise.resolve([] as Token[]) }
+  const entry = { at: Date.now(), ttl: KEEP, list: Promise.resolve([] as Entry[]) }
   entry.list = (async () => {
     // Until the bridges' chain lists load (a few seconds after start), a chain has none of their ids, so no token list.
     await ready
@@ -153,14 +190,16 @@ function catalog(asked: ChainInfo): Promise<Token[]> {
           return [] as Listed[]
         })
       : []
-    const own = listed.filter((t) => !(gasIsUsdc(chain) && chain.native && sameAddress(t.address, chain.native.address)))
-    // The basics keep their exact address and symbol, with the catalog's logo and price.
+    const own = listed.filter((t) => chain.kind !== 'evm' || !sameAddress(t.address, NATIVE) || gasToken(chain) === NATIVE)
+    // The basics keep their exact address, symbol and decimals, with the catalog's logo, price and market data.
     const base = basics(chain).map((b) => {
       const t = own.find((t) => sameAddress(t.address, b.address))
-      return { ...b, logo: t?.logo ?? b.logo, priceUsd: t?.priceUsd }
+      return { ...t, ...b, logo: t?.logo ?? b.logo }
     })
     const list = [...base, ...own.filter((t) => !base.some((b) => sameAddress(b.address, t.address)))].map((t) => ({ chain: chain.id, ...t }))
-    return chain.cosmosSide ? sideTokens(chain, list).catch(() => ((entry.ttl = 60_000), list)) : list
+    // Injective without its Cosmos side (Skip's chain list hadn't loaded) lacks that side's tokens until it's asked again.
+    const sided = chain.kind === 'evm' && !!ONE_CHAIN[chain.chainId!]
+    return sided ? sideTokens(chain, list).catch(() => ((entry.ttl = 60_000), list)) : list
   })()
   catalogs.set(asked.id, entry)
   return entry.list
@@ -172,7 +211,7 @@ function catalog(asked: ChainInfo): Promise<Token[]> {
 // chain's erc20 module. Kept 6 hours.
 type Pairs = { erc20: Map<string, string>; denom: Map<string, string> } // denom → ERC20, lowercased ERC20 → denom
 const pairCache = new Map<string, { at: number; pairs: Promise<Pairs> }>()
-function tokenPairs(side: ChainInfo): Promise<Pairs> {
+export function tokenPairs(side: ChainInfo): Promise<Pairs> {
   const hit = pairCache.get(side.id)
   if (hit && Date.now() - hit.at < 6 * 3600_000) return hit.pairs
   const pairs = getList<{ token_pairs: { bank_denom: string; erc20_address: string }[] }>(
@@ -192,17 +231,18 @@ function tokenPairs(side: ChainInfo): Promise<Pairs> {
 
 // The EVM side's list, plus the Cosmos side's tokens it lacks: by their ERC20 twin's address where they have one (the
 // same token, which both sides' bridges take), else by denom.
-async function sideTokens(chain: ChainInfo, list: Token[]) {
-  const side = chainById(chain.cosmosSide!)
-  if (!side) return list
+async function sideTokens(chain: ChainInfo, list: Entry[]) {
+  const side = chain.cosmosSide ? chainById(chain.cosmosSide) : undefined
+  if (!side) throw new Error('no Cosmos side')
   const [theirs, pairs] = await Promise.all([catalog(side), tokenPairs(side)])
-  if (!theirs.length) throw new Error('no Cosmos side tokens') // asked again in a minute, like a failed list
+  // A side list that failed (just its basics, asked again in a minute) fails this one too, so both heal together.
+  if ((catalogs.get(side.id)?.ttl ?? 0) < KEEP) throw new Error('no Cosmos side tokens')
   const merged = [...list]
   for (const t of theirs) {
     if (side.native && t.address === side.native.address) continue // INJ: the EVM side's gas token
     const erc20 = pairs.erc20.get(t.address)
     const same = erc20 ? merged.findIndex((m) => sameAddress(m.address, erc20)) : -1
-    if (same >= 0) merged[same] = { ...merged[same]!, logo: merged[same]!.logo ?? t.logo }
+    if (same >= 0) merged[same] = { ...merged[same]!, logo: merged[same]!.logo ?? t.logo, coingeckoId: merged[same]!.coingeckoId ?? t.coingeckoId }
     else merged.push({ ...t, chain: chain.id, address: erc20 ?? t.address })
   }
   return merged
@@ -223,11 +263,14 @@ export async function warmTokens(chains: ChainInfo[]) {
   for (const chain of chains) await catalog(chain)
 }
 
-const isNativeToken = (chain: ChainInfo, address: string) => !!chain.native && sameAddress(address, chain.native.address)
+const isNativeToken = (chain: ChainInfo, address: string) => {
+  const gas = gasToken(chain)
+  return !!gas && sameAddress(address, gas)
+}
 
-function popular(chain: ChainInfo, list: Token[]) {
+function popular(chain: ChainInfo, list: Entry[]) {
   const nativeSymbol = list.find((t) => isNativeToken(chain, t.address))?.symbol
-  const picked: Token[] = []
+  const picked: Entry[] = []
   for (const symbol of POPULAR.map((s) => (s === '$native' ? nativeSymbol : s))) {
     const t = list.find((t) => t.symbol === symbol && (t.verified || isNativeToken(chain, t.address)) && !picked.includes(t))
     if (t) picked.push(t)
@@ -252,23 +295,32 @@ export async function tokens(id: string | number, query = '') {
     // The popular ones first, then tokens with a logo: the catalogs' own order puts obscure tokens early.
     const top = popular(chain, list)
     const rest = list.filter((t) => t.verified && !top.includes(t))
-    return { popular: top, tokens: [...top, ...rest.filter((t) => t.logo), ...rest.filter((t) => !t.logo)].slice(0, 100) }
+    return { popular: top.map(publicToken), tokens: [...top, ...rest.filter((t) => t.logo), ...rest.filter((t) => !t.logo)].slice(0, 100).map(publicToken) }
   }
   // Injective lists a token with an ERC20 twin by the twin's address; its denom finds it too.
   const side = chain.cosmosSide ? chainById(chain.cosmosSide) : undefined
   const twin = side && !isAddress(q) ? (await tokenPairs(side).catch(() => undefined))?.erc20.get(q) : undefined
   const exact = list.find((t) => sameAddress(t.address, twin ?? q) || ((chain.kind === 'cosmos' || !!side) && t.address.toLowerCase() === q.toLowerCase()))
-  if (exact) return { popular: [], tokens: [exact] }
+  if (exact) return { popular: [], tokens: [publicToken(exact)] }
   if (isTokenAddress(chain, q)) return { popular: [], tokens: [await lookup(chain, q)] }
   const needle = q.toLowerCase()
-  const rank = (t: Token) => {
+  const rank = (t: Entry) => {
     const symbol = t.symbol.toLowerCase()
     const match = symbol === needle ? 0 : symbol.startsWith(needle) ? 1 : symbol.includes(needle) ? 2 : t.name.toLowerCase().includes(needle) ? 3 : -1
     return match < 0 ? -1 : match * 4 + (t.verified ? 0 : 2) + (t.logo ? 0 : 1)
   }
   const found = list.map((t) => [rank(t), t] as const).filter(([r]) => r >= 0)
   found.sort((a, b) => a[0] - b[0]) // stable: keeps the catalog's order within a rank
-  return { popular: [], tokens: found.slice(0, 50).map(([, t]) => t) }
+  return { popular: [], tokens: found.slice(0, 50).map(([, t]) => publicToken(t)) }
+}
+
+// A listed token (never one read from the chain): the catalog's entry for an address, mint or denom. On Injective a
+// denom finds its ERC20 twin, and the gas token's denom (inj) the gas token.
+export async function findEntry(chain: ChainInfo, address: string): Promise<Entry | undefined> {
+  const list = await catalog(chain)
+  const side = chain.cosmosSide ? chainById(chain.cosmosSide) : undefined
+  const own = side && !isAddress(address) ? (address === side.native?.address ? NATIVE : (await tokenPairs(side).catch(() => undefined))?.erc20.get(address)) : undefined
+  return list.find((t) => sameAddress(t.address, own ?? address))
 }
 
 // A token outside the list, read from its contract (or mint).

@@ -24,12 +24,10 @@ import {
   injective,
   INJECTIVE_DOMAIN,
   IRIS_API,
-  MESSAGE_TRANSMITTER,
   minRedeemAmount,
   relayer,
   solana,
   SOLANA_DOMAIN,
-  TOKEN_MESSENGER,
   txUrl,
 } from './config'
 import {
@@ -57,6 +55,13 @@ export class HttpError extends Error {
     super(message)
     this.status = status
   }
+}
+
+// The promise's answer, or the error once ms have passed.
+export function within<T>(promise: Promise<T>, ms: number, error = new Error('timeout')): Promise<T> {
+  let timer: Timer | undefined
+  const late = new Promise<never>((_, reject) => (timer = setTimeout(() => reject(error), Math.max(ms, 0))))
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer))
 }
 
 export type Transfer = {
@@ -101,6 +106,8 @@ const MessageSent = parseAbiItem('event MessageSent(bytes message)')
 // Hook data that asks Circle's Forwarding Service to mint on the destination chain: https://developers.circle.com/cctp/concepts/forwarding-service
 const FORWARD_HOOK = toHex('cctp-forward')
 const SOLANA_TOKEN_MESSENGER = hexKey(publicKey(solana.tokenMessenger)!)
+// Every EVM chain's TokenMessenger: most share one address, a few (EDGE) have their own.
+const TOKEN_MESSENGERS = new Set(chains.map((chain) => chain.tokenMessenger.toLowerCase()))
 // Circle's average wait for a standard attestation, on the sources where it's more than a few seconds:
 // https://developers.circle.com/cctp/required-block-confirmations
 const SLOW_FINALITY: Record<number, string> = {
@@ -200,7 +207,7 @@ const word = (b: Hex) => (b.startsWith('0x000000000000000000000000') ? `0x${b.sl
 
 // MessageV2 header (148 bytes) + BurnMessageV2 body: https://developers.circle.com/cctp/references/technical-guide
 // A USDC burn is a message between TokenMessengers: the one on an EVM chain or Solana is the sender or the recipient.
-const isTokenMessenger = (b: Hex) => same(word(b), TOKEN_MESSENGER) || same(b, SOLANA_TOKEN_MESSENGER)
+const isTokenMessenger = (b: Hex) => TOKEN_MESSENGERS.has(word(b)) || same(b, SOLANA_TOKEN_MESSENGER)
 function decodeBurn(message: Hex) {
   const field = (offset: number, length: number) => slice(message, offset, offset + length)
   if (size(message) < 376 || !(isTokenMessenger(field(44, 32)) || isTokenMessenger(field(76, 32)))) return
@@ -238,10 +245,11 @@ async function locate(hash: Hex): Promise<{ domain: number; receipt?: Transactio
 // CCTP messages emitted on the source chain, in log order.
 async function sentMessages(domain: number, hash: Hex, receipt?: TransactionReceipt): Promise<Hex[]> {
   if (domain === SOLANA_DOMAIN) return solanaMessages(hash)
-  receipt ??= await chainOf(domain)?.client.getTransactionReceipt({ hash }).catch(() => undefined)
-  if (!receipt) return []
+  const chain = chainOf(domain)
+  receipt ??= await chain?.client.getTransactionReceipt({ hash }).catch(() => undefined)
+  if (!chain || !receipt) return []
   return parseEventLogs({ abi: [MessageSent], logs: receipt.logs })
-    .filter((log) => same(log.address, MESSAGE_TRANSMITTER))
+    .filter((log) => same(log.address, chain.messageTransmitter))
     .map((log) => log.args.message)
 }
 
@@ -250,7 +258,7 @@ async function minted(domain: number, nonce: Hex) {
   if (domain === SOLANA_DOMAIN) return mintedOnSolana(nonce)
   const chain = chainOf(domain)
   if (!chain) return
-  const used = await chain.client.readContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'usedNonces', args: [nonce] }).catch(() => {
+  const used = await chain.client.readContract({ address: chain.messageTransmitter, abi: transmitterAbi, functionName: 'usedNonces', args: [nonce] }).catch(() => {
     throw new HttpError(502, `Could not reach ${chain.name}, try again.`)
   })
   return used !== 0n
@@ -573,9 +581,9 @@ async function mint(ready: Found[]) {
 
 async function send({ transfer, message, attestation }: Found): Promise<Hex> {
   const args = [message!, attestation!] as const
-  const gas = await injective.client.estimateContractGas({ account: relayer!.account, address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'receiveMessage', args })
+  const gas = await injective.client.estimateContractGas({ account: relayer!.account, address: injective.messageTransmitter, abi: transmitterAbi, functionName: 'receiveMessage', args })
   // Padded: USDC on Injective runs a compliance hook on mint that fails when the gas limit is tight.
-  const hash = await relayer!.writeContract({ address: MESSAGE_TRANSMITTER, abi: transmitterAbi, functionName: 'receiveMessage', args, gas: (gas * 3n) / 2n })
+  const hash = await relayer!.writeContract({ address: injective.messageTransmitter, abi: transmitterAbi, functionName: 'receiveMessage', args, gas: (gas * 3n) / 2n })
   const receipt = await injective.client.waitForTransactionReceipt({ hash, timeout: 60_000 })
   if (receipt.status !== 'success') throw new Error(`transaction ${hash} reverted`)
   saveRedeem(transfer.nonce!, hash)

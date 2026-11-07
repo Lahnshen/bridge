@@ -16,7 +16,7 @@ const INDEXER = 'https://sentry.exchange.grpc-web.injective.network'
 const E18 = 10n ** 18n
 const TICK = 10n ** 15n // 0.001: the market's price tick (USDC) and quantity tick (INJ)
 const TAKER_FEE = 10n ** 12n // 0.000001, ×1e18
-const MIN_USDC = 1_100_000n // orders must be worth at least 1 USDC
+export const MIN_USDC = 1_100_000n // orders must be worth at least 1 USDC
 const SLIPPAGE = 2n // per mille: how far the book may move up between the quote and the order
 
 export const swapsEnabled = !!relayer && network === 'mainnet'

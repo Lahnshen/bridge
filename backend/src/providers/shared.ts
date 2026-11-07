@@ -22,12 +22,18 @@ export type QuoteRequest = {
   addresses: { chain: ChainInfo; address: string }[] // the user's other accounts, for chains a route passes through
   slippageBps: number
   preview: boolean // sender or recipient is a placeholder: only the price matters, steps may be left out
+  topupGasUsd?: number // also deliver this much of the destination's gas token, in dollars (Relay only, EVM destinations)
 }
 
+// Swaps on one chain: LI.FI and Relay on EVM chains and Solana, Skip on EVM and Cosmos chains (it has none on Solana).
+// Across, deBridge (a different API for these), USDT0 and LayerZero only bridge.
+const swapsOn = (id: ProviderId, chain: ChainInfo) =>
+  id === 'skip' ? chain.kind === 'evm' || chain.kind === 'cosmos' : (id === 'lifi' || id === 'relay') && (chain.kind === 'evm' || chain.kind === 'solana')
+
 // Both chains on the provider's list, and a source the app can sign for: EVM chains and Solana, Cosmos chains with Skip,
-// and Hyperliquid with Relay.
+// and Hyperliquid with Relay. The same chain twice is a swap, for the providers that do them.
 export const reaches = (id: ProviderId, from: ChainInfo, to: ChainInfo) =>
-  from.id !== to.id &&
+  (from.id !== to.id || swapsOn(id, from)) &&
   from.ids[id] !== undefined &&
   to.ids[id] !== undefined &&
   (from.kind === 'evm' || from.kind === 'solana' || (from.kind === 'cosmos' && id === 'skip') || (from.kind === 'hypercore' && id === 'relay'))
@@ -65,6 +71,7 @@ export type Quote = {
   steps: Step[] // empty for previews
   needs?: string[] // chains the route passes through where it needs one of the user's addresses (registry ids)
   side?: string // for a chain with a Cosmos side (Injective): that side's registry id, when the route starts or ends there
+  gasTopup?: { amount: string; usd?: number } // the destination's gas token delivered besides amountOut (topupGasUsd), base units
   track: Record<string, string> // what status() needs besides the source tx hash
 }
 
@@ -115,8 +122,12 @@ export const sum = (values: (number | string | undefined)[]) => values.reduce<nu
 export const usdValue = (value?: number | string | null) => (Number(value) > 0 ? Number(value) : undefined)
 
 // An ERC-20 approve the app can skip when the allowance already covers it, for the transfer's amount (not the unlimited
-// one some APIs ask for). A reset to 0, which USDT needs before a new allowance, stays an ordinary transaction.
+// one some APIs ask for). A reset to 0, which USDT needs before a new allowance, stays an ordinary transaction. Any other
+// call with approve's selector is refused: extra bytes after the arguments would otherwise pass it off as a plain call.
+// The token is the provider's: ../safety.ts refuses the quote unless it's the one being sent.
 export function approval(tx: { chainId: number; to: Hex; data: Hex }, amount: bigint): Step | undefined {
-  if (!/^0x095ea7b3[0-9a-f]{128}$/i.test(tx.data) || BigInt(`0x${tx.data.slice(74)}`) === 0n) return
+  if (!tx.data.toLowerCase().startsWith('0x095ea7b3')) return
+  if (!/^0x095ea7b3(0{24}[0-9a-f]{40})[0-9a-f]{64}$/i.test(tx.data)) throw new ProviderError(400, `Malformed approval of ${tx.to} in the route`)
+  if (BigInt(`0x${tx.data.slice(74)}`) === 0n) return
   return { kind: 'approve', chainId: tx.chainId, token: tx.to, spender: `0x${tx.data.slice(34, 74)}`, amount: amount.toString() }
 }

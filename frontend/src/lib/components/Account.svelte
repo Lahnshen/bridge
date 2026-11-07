@@ -17,6 +17,8 @@
   let { compact = false, kind = 'evm' }: { compact?: boolean; kind?: 'evm' | 'solana' | 'cosmos' } = $props()
   const connected = $derived(kind === 'solana' ? solanaWallet : kind === 'cosmos' ? cosmosWallet : wallet)
   const network = $derived(kind === 'solana' ? 'Solana' : kind === 'cosmos' ? (chainById(cosmosWallet.chain)?.name ?? 'Cosmos') : '')
+  // Disconnecting drops every account connected (Onboard can have several).
+  const all = $derived((kind === 'solana' ? solanaWallet.accounts : kind === 'evm' ? wallet.accounts : []).length > 1)
 
   let open = $state(false)
   let copied = $state(false)
@@ -89,7 +91,7 @@
             else disconnect()
           }}
         >
-          <LogOutIcon class="size-3.5" /> Disconnect
+          <LogOutIcon class="size-3.5" /> {all ? 'Disconnect all accounts' : 'Disconnect'}
         </button>
       </div>
     {/if}

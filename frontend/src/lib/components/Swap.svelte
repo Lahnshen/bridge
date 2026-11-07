@@ -6,14 +6,14 @@
   import usdcLogo from '../../assets/usdc.svg'
   import { Button } from '$lib/components/ui/button'
   import { Spinner } from '$lib/components/ui/spinner'
-  import { getBalance, getSwapQuote, INJECTIVE, swap, type Hex, type SwapQuote, type SwapResult } from '$lib/api'
-  import { app, injective } from '$lib/app.svelte'
+  import { getBalance, getSwapQuote, INJECTIVE, type SwapQuote, type SwapResult } from '$lib/api'
+  import { app } from '$lib/app.svelte'
   import { formatUsdc, parseUsdc, usdcString } from '$lib/evm'
+  import { getInj } from '$lib/get-inj'
   import { acceptTerms } from '$lib/terms.svelte'
-  import { connectWallet, signTypedData, switchChain, wallet, walletError } from '$lib/wallet.svelte'
+  import { connectWallet, wallet, walletError } from '$lib/wallet.svelte'
 
-  // USDC on Injective to INJ for gas. The wallet only signs a message (an EIP-3009 authorization to move the USDC);
-  // the server's relayer sends the transactions, buys INJ on Injective's INJ/USDC market, and pays the gas.
+  // USDC on Injective to INJ for gas, gas free (see get-inj.ts).
 
   const MIN = 1_100_000n // the market's minimum order is 1 USDC, plus room for its fee and slippage
   const PRESETS = ['2', '5', '20']
@@ -78,43 +78,12 @@
     else event.currentTarget.value = amountText
   }
 
-  const random32 = () => `0x${[...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('')}` as Hex
-
   async function submit() {
     if (!wallet.address) return connectWallet()
     if (!(await acceptTerms())) return
-    const from = wallet.address
     error = ''
     try {
-      // Wallets only sign typed data for the chain they're on.
-      busy = 'Switching to Injective…'
-      await switchChain(injective())
-      const fresh = await getSwapQuote(usdcString(amount!))
-      const message = { from, to: fresh.to, value: String(amount), validAfter: 0, validBefore: Math.floor(Date.now() / 1000) + 600, nonce: random32() }
-      busy = 'Sign the swap in your wallet…'
-      const signature = await signTypedData({
-        types: {
-          EIP712Domain: [
-            { name: 'name', type: 'string' },
-            { name: 'version', type: 'string' },
-            { name: 'chainId', type: 'uint256' },
-            { name: 'verifyingContract', type: 'address' },
-          ],
-          ReceiveWithAuthorization: [
-            { name: 'from', type: 'address' },
-            { name: 'to', type: 'address' },
-            { name: 'value', type: 'uint256' },
-            { name: 'validAfter', type: 'uint256' },
-            { name: 'validBefore', type: 'uint256' },
-            { name: 'nonce', type: 'bytes32' },
-          ],
-        },
-        primaryType: 'ReceiveWithAuthorization',
-        domain: fresh.domain,
-        message,
-      })
-      busy = 'Swapping…'
-      done = await swap({ ...message, signature, minInj: fresh.minInj })
+      done = await getInj(amount!, (step) => (busy = step))
       amountText = ''
       balanceAttempt++
     } catch (err) {

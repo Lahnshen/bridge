@@ -1,21 +1,77 @@
 import cctpLogo from '../assets/providers/cctp.svg'
-import { broadcastCosmosTx, cosmosTxStatus, INJECTIVE, prepareCosmosTx, type Chain, type CosmosChain, type EvmChain, type Hex, type Step, type TypedData } from './api'
-import { cosmosKey, signCosmos } from './cosmos-wallet.svelte'
-import { encode } from './evm'
+import { injectiveAddress, parseAddress, walletKind } from './address'
+import { broadcastCosmosTx, cosmosTxStatus, INJECTIVE, prepareCosmosTx, type Chain, type CosmosChain, type EvmChain, type Hex, type Quote, type Step, type Token, type TypedData } from './api'
+import { chainById } from './app.svelte'
+import { addressFromWallet, connectCosmosWallet, cosmosKey, cosmosWallet, derivedAddress, signCosmos } from './cosmos-wallet.svelte'
+import { amountString, encode } from './evm'
+import { sendWithEvmWallet } from './injective-eip712'
 import { sendSigned } from './solana'
-import { signSolanaTransaction } from './solana-wallet.svelte'
-import { call, currentChain, sendTx, signTypedData, switchChain, waitForReceipt, wallet } from './wallet.svelte'
+import { signSolanaTransaction, solanaWallet } from './solana-wallet.svelte'
+import { addRecent } from './transfers.svelte'
+import { call, connectWallet, currentChain, sendTx, signTypedData, sleep, switchChain, waitForReceipt, wallet } from './wallet.svelte'
 
-// Bridges other than CCTP: their logos, and running the steps of one of their quotes with the connected wallet.
+// Bridges other than CCTP: their logos, the connected wallets' accounts on a route's chains, running the steps of one of
+// their quotes with the connected wallet, and the transfer it sent into Recent. The Bridge and Onboard tabs both send so.
 
 const files = import.meta.glob<string>('../assets/providers/*.{svg,png,jpg}', { eager: true, query: '?url', import: 'default' })
 export const providerLogo = (id: string) => (id === 'cctp' ? cctpLogo : Object.entries(files).find(([path]) => path.split('/').pop()!.split('.')[0] === id)?.[1])
 
 // USDT on Ethereum refuses to change an allowance that isn't zero.
-const RESET_FIRST = new Set(['0xdac17f958d2ee523a2206206994597c13d831ec7'])
+export const RESET_FIRST = new Set(['0xdac17f958d2ee523a2206206994597c13d831ec7'])
 
 const base64Bytes = (value: string) => Uint8Array.from(atob(value), (c) => c.charCodeAt(0))
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// ---- Accounts -----------------------------------------------------------------------------------
+
+// The connected wallet's address on a chain: the EVM wallet's on EVM chains (and Hyperliquid, Lighter), the Solana
+// wallet's on Solana and Eclipse, and on Cosmos chains the Cosmos wallet's, which it gives per chain. To receive, an
+// address the account surely has there does too (see derivedAddress). On Injective without an EVM wallet, the Cosmos
+// wallet's inj1… account, as 0x… (the same account).
+export function addressOn(chain: Chain, receiving = false) {
+  const kind = walletKind(chain)
+  if (kind === 'evm') return wallet.address?.toLowerCase() ?? cosmosSideAddress(chain)
+  if (kind === 'solana') return solanaWallet.address
+  if (chain.kind !== 'cosmos') return
+  return receiving ? derivedAddress(chain) : cosmosWallet.addresses[chain.id]
+}
+const cosmosSideAddress = (chain: Chain) => {
+  const theirs = chain.kind === 'evm' && chain.cosmos ? cosmosWallet.addresses[chain.cosmos.id] : undefined
+  return theirs && parseAddress(chain, theirs)
+}
+
+// Injective's Cosmos side, when a route starts or ends there (side: its id): the transfer's transactions are that side's.
+export const sideOf = (chain: Chain, side?: string) => (chain.kind === 'evm' && chain.cosmos && chain.cosmos.id === side ? chain.cosmos : undefined)
+
+// The account that signs on Injective's Cosmos side: Keplr's where it's connected, else the EVM wallet's (its inj1… form),
+// which signs there as EIP-712 typed data (see injective-eip712.ts).
+export async function cosmosSigner(side: CosmosChain, progress: (label: string) => void) {
+  if (!cosmosWallet.connected && wallet.address) return injectiveAddress(wallet.address)
+  if (!cosmosWallet.connected) {
+    void connectWallet()
+    throw new Error(`This route starts on ${side.name}'s Cosmos side: connect a wallet, then try again.`)
+  }
+  progress(`Getting your ${side.name} address…`)
+  return cosmosWallet.addresses[side.id] ?? (await addressFromWallet(side))
+}
+
+// The user's addresses on chains a route passes through (for the transfer to stop at, should it stop on the way), from
+// the Cosmos wallet, which may ask to allow each chain.
+export async function addressesFor(ids: string[], progress: (label: string) => void) {
+  const found: Record<string, string> = {}
+  for (const id of ids) {
+    const chain = chainById(id)
+    if (chain?.kind !== 'cosmos') throw new Error(`This route needs your address on ${chain?.name ?? id}, which no wallet here gives.`)
+    if (!cosmosWallet.connected) {
+      void connectCosmosWallet(chain)
+      throw new Error(`This route passes through ${chain.name}: connect Keplr for your address there, then try again.`)
+    }
+    progress(`Getting your ${chain.name} address…`)
+    found[id] = derivedAddress(chain) ?? (await addressFromWallet(chain))
+  }
+  return found
+}
+
+// ---- Sending ------------------------------------------------------------------------------------
 
 // eth_signTypedData_v4 wants the domain's own type spelled out, field by field.
 const DOMAIN_FIELDS = [['name', 'string'], ['version', 'string'], ['chainId', 'uint256'], ['verifyingContract', 'address'], ['salt', 'bytes32']]
@@ -77,9 +133,16 @@ export async function runSteps(chain: Chain, steps: Step[], progress: (label: st
     }
     if (step.kind === 'cosmos') {
       // The server builds the transaction (and simulates it for the gas), the wallet signs it, the server broadcasts it.
-      // From Injective that's on its Cosmos side.
+      // From Injective that's on its Cosmos side, where the EVM wallet signs when Keplr isn't connected (see cosmosSigner),
+      // or when it's from the EVM wallet's account and not Keplr's (another of the user's accounts, in Onboard).
       const cosmos = chain.kind === 'evm' && chain.cosmos ? chain.cosmos : (chain as CosmosChain)
       if (step.chainId !== cosmos.cosmosId) throw new Error('This route sends from another chain, pick it again.')
+      const evmSigns = !!wallet.address && (!cosmosWallet.connected || (step.signer === injectiveAddress(wallet.address) && cosmosWallet.addresses[cosmos.id] !== step.signer))
+      if (cosmos !== chain && evmSigns) {
+        hash = await sendWithEvmWallet(cosmos, step, progress, last ? 'Confirm the transfer in your wallet…' : 'Confirm in your wallet…')
+        if (!last && !(await cosmosConfirmed(cosmos, hash))) throw new Error('The transaction failed.')
+        continue
+      }
       progress('Preparing the transaction…')
       const key = await cosmosKey(cosmos)
       if (key.address !== step.signer) throw new Error('Your wallet changed accounts: pick the route again.')
@@ -104,7 +167,7 @@ export async function runSteps(chain: Chain, steps: Step[], progress: (label: st
         progress('Approve the token in your wallet…')
         const approval = await sendTx(evm, { to: step.token, data: encode.approve(step.spender, value) }, { padGas })
         progress('Approving…')
-        if (!(await waitForReceipt(approval))) throw new Error('The approval failed.')
+        if (!(await waitForReceipt(approval, evm))) throw new Error('The approval failed.')
       }
       continue
     }
@@ -113,11 +176,30 @@ export async function runSteps(chain: Chain, steps: Step[], progress: (label: st
     // A route with several transactions sends each once the one before it went through.
     if (!last) {
       progress('Waiting for the transaction…')
-      if (!(await waitForReceipt(hash as Hex))) throw new Error('The transaction failed.')
+      if (!(await waitForReceipt(hash as Hex, evm))) throw new Error('The transaction failed.')
     }
   }
   if (!hash) throw new Error('This route has nothing to send.')
   return hash
+}
+
+// A transfer through another bridge, into Recent, which follows it to the end. The sides are Injective's Cosmos side where
+// the route starts or ends there. Solana's and Hyperliquid's transfers are final once accepted ('pending'); elsewhere
+// the transaction still has to confirm ('confirming').
+export type Sent = { hash: string; from: Chain; to: Chain; fromSide?: Chain; toSide?: Chain; amount: bigint; fromToken: Token; toToken: Token; quote: Pick<Quote, 'provider' | 'name' | 'via' | 'track' | 'amountOut'>; createdAt?: number }
+export function addRouteRecent({ hash, from, to, fromSide, toSide, amount, fromToken, toToken, quote, createdAt = Date.now() }: Sent) {
+  const info = ({ address, symbol, decimals, logo }: Token) => ({ address, symbol, decimals, logo })
+  return addRecent({
+    txHash: hash,
+    from: (fromSide ?? from).id,
+    to: (toSide ?? to).id,
+    sourceDomain: from.domain,
+    destinationDomain: to.domain,
+    amount: amountString(amount, fromToken.decimals),
+    createdAt,
+    status: from.kind === 'solana' || from.kind === 'hypercore' ? 'pending' : 'confirming',
+    route: { provider: quote.provider, name: quote.name, via: quote.via, track: quote.track, fromToken: info(fromToken), toToken: info(toToken), amountOut: quote.amountOut },
+  })
 }
 
 // Resolves to whether a Cosmos transaction succeeded, once a block has it (blocks take a few seconds).

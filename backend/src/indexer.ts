@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { BaseError, hexToBigInt, hexToNumber, parseAbiItem, parseEventLogs, size, slice, type Hex, type TransactionReceipt } from 'viem'
-import { chains, dbPath, historyFromBlock, INJECTIVE_DOMAIN, lookbackHours, MESSAGE_TRANSMITTER, pollMs, TOKEN_MESSENGER, type EvmChain } from './config'
+import { chainOf, chains, dbPath, historyFromBlock, INJECTIVE_DOMAIN, lookbackHours, pollMs, type EvmChain } from './config'
 
 // Watches every EVM chain for burns, and Injective for mints arriving too, so transfers can be looked up by wallet address.
 // Injective sees both sides of every transfer to or from it, so it's indexed all the way back for full history. Burns on
@@ -89,8 +89,11 @@ function saveMints(mints: Mint[], times: Map<bigint, number>) {
   }
 }
 
-export const indexReceipt = (domain: number, receipt: TransactionReceipt) =>
-  saveBurns(domain, parseEventLogs({ abi: [DepositForBurn], logs: receipt.logs }).filter((l) => l.address.toLowerCase() === TOKEN_MESSENGER.toLowerCase()))
+// Burns are the chain's own TokenMessenger's events (EDGE's differs from the others').
+export const indexReceipt = (domain: number, receipt: TransactionReceipt) => {
+  const chain = chainOf(domain)
+  if (chain) saveBurns(domain, parseEventLogs({ abi: [DepositForBurn], logs: receipt.logs }).filter((l) => same(l.address, chain.tokenMessenger)))
+}
 
 export const domainOf = (txHash: string) =>
   db.query<{ domain: number }, [string]>('SELECT domain FROM burns WHERE tx_hash = ? LIMIT 1').get(txHash.toLowerCase())?.domain
@@ -258,17 +261,17 @@ async function backfill(chain: EvmChain, fromBlock: number) {
   console.log(`[indexer] ${name} history indexed back to block ${fromBlock}`)
 }
 
-async function indexRange({ domain, client }: EvmChain, from: number, to: number) {
+async function indexRange({ domain, client, tokenMessenger, messageTransmitter }: EvmChain, from: number, to: number) {
   const hub = domain === INJECTIVE_DOMAIN
   const logs = await client.getLogs({
-    address: hub ? [TOKEN_MESSENGER, MESSAGE_TRANSMITTER] : TOKEN_MESSENGER,
+    address: hub ? [tokenMessenger, messageTransmitter] : tokenMessenger,
     events: hub ? [DepositForBurn, MessageReceived] : [DepositForBurn],
     fromBlock: BigInt(from),
     toBlock: BigInt(to),
     strict: true,
   })
-  const burns = logs.filter((l) => l.eventName === 'DepositForBurn' && same(l.address, TOKEN_MESSENGER)) as Burn[]
-  const mints = logs.filter((l) => l.eventName === 'MessageReceived' && same(l.address, MESSAGE_TRANSMITTER)) as Mint[]
+  const burns = logs.filter((l) => l.eventName === 'DepositForBurn' && same(l.address, tokenMessenger)) as Burn[]
+  const mints = logs.filter((l) => l.eventName === 'MessageReceived' && same(l.address, messageTransmitter)) as Mint[]
   const times = await blockTimes(client, [...burns, ...mints].map((l) => l.blockNumber))
   db.transaction(() => {
     saveBurns(domain, burns, times)

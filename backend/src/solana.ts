@@ -80,11 +80,15 @@ export function findProgramAddress(seeds: Uint8Array[], program: Uint8Array): Ui
   throw new Error('No program address found')
 }
 
-const TOKEN_PROGRAM = publicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')!
+// The token program and Token-2022.
+export const TOKEN_PROGRAMS = ['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb']
+const TOKEN_PROGRAM = publicKey(TOKEN_PROGRAMS[0]!)!
 const ASSOCIATED_TOKEN_PROGRAM = publicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL')!
 
+// A wallet's own account of a mint (its associated token account), under the token program that has the mint.
+export const tokenAccount = (owner: Uint8Array, mint: Uint8Array, program = TOKEN_PROGRAM) => findProgramAddress([owner, program, mint], ASSOCIATED_TOKEN_PROGRAM)
 // The wallet's USDC account, which is where CCTP mints USDC on Solana.
-export const usdcAccount = (owner: Uint8Array) => findProgramAddress([owner, TOKEN_PROGRAM, publicKey(solana.usdc)!], ASSOCIATED_TOKEN_PROGRAM)
+export const usdcAccount = (owner: Uint8Array) => tokenAccount(owner, publicKey(solana.usdc)!)
 
 export const hexKey = (bytes: Uint8Array): Hex => toHex(bytes)
 

@@ -1,11 +1,13 @@
 <script lang="ts">
   import ArrowLeftRightIcon from '@lucide/svelte/icons/arrow-left-right'
+  import CombineIcon from '@lucide/svelte/icons/combine'
   import FuelIcon from '@lucide/svelte/icons/fuel'
   import SearchIcon from '@lucide/svelte/icons/search'
   import backdrop from './assets/backdrop.jpg'
   import logo from './assets/lahn.png'
   import Account from '$lib/components/Account.svelte'
   import Bridge from '$lib/components/Bridge.svelte'
+  import Onboard from '$lib/components/Onboard.svelte'
   import RecentList from '$lib/components/RecentList.svelte'
   import Swap from '$lib/components/Swap.svelte'
   import Terms, { SOURCE_URL } from '$lib/components/Terms.svelte'
@@ -31,6 +33,7 @@
   const NAV = $derived(
     [
       { view: 'bridge', label: 'Bridge', icon: ArrowLeftRightIcon },
+      { view: 'onboard', label: 'Onboard', icon: CombineIcon },
       { view: 'swap', label: 'Get INJ', icon: FuelIcon },
       { view: 'track', label: 'Track', icon: SearchIcon },
     ].filter((item) => item.view !== 'swap' || app.config?.swap) as { view: typeof app.view; label: string; icon: typeof SearchIcon }[],
@@ -87,7 +90,7 @@
 
     <main class="dots flex flex-1 flex-col px-4 pt-6 pb-6 md:pt-[10vh]">
       <div class="mx-auto w-full max-w-[26rem] flex-1">
-        <div class={['bg-muted/70 mb-8 grid rounded-md p-0.5 md:hidden', NAV.length === 3 ? 'grid-cols-3' : 'grid-cols-2']}>
+        <div class={['bg-muted/70 mb-8 grid rounded-md p-0.5 md:hidden', NAV.length === 4 ? 'grid-cols-4' : NAV.length === 3 ? 'grid-cols-3' : 'grid-cols-2']}>
           {#each NAV as item (item.view)}
             <button
               class={['h-8 rounded-sm text-[13px] font-medium transition-colors', app.view === item.view ? 'bg-background shadow-xs dark:bg-white/12' : 'text-muted-foreground']}
@@ -103,6 +106,7 @@
         {/if}
         {#if app.config}
           <div class={{ hidden: app.view !== 'bridge' }}><Bridge /></div>
+          <div class={{ hidden: app.view !== 'onboard' }}><Onboard /></div>
           {#if app.config.swap}<div class={{ hidden: app.view !== 'swap' }}><Swap /></div>{/if}
           <div class={{ hidden: app.view !== 'track' }}><Track /></div>
         {:else if app.view === 'terms'}

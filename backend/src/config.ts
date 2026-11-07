@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, defineChain, fallback, http, parseUnits, type Chain, type Hex } from 'viem'
+import { createPublicClient, createWalletClient, defineChain, fallback, getAddress, http, parseUnits, type Chain, type Hex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import * as c from 'viem/chains'
 
@@ -13,6 +13,7 @@ export const corsOrigins = (env.CORS_ORIGIN || '*').split(',').map((o) => o.trim
 export const trustProxy = env.TRUST_PROXY === 'true'
 export const requestsPerMinute = num(env.RATE_LIMIT_PER_MINUTE, 120)
 export const redeemsPerMinute = num(env.REDEEM_LIMIT_PER_MINUTE, 5)
+export const onboardPerMinute = num(env.ONBOARD_LIMIT_PER_MINUTE, 40)
 export const minRedeemAmount = parseUnits(env.MIN_REDEEM_USDC || '0', 6)
 export const swapMaxUsdc = parseUnits(env.SWAP_MAX_USDC || '10000', 6)
 export const dbPath = env.DB_PATH || 'cctp.sqlite'
@@ -24,9 +25,15 @@ export const historyFromBlock = testnet ? undefined : 158_605_712
 export const IRIS_API = testnet ? 'https://iris-api-sandbox.circle.com' : 'https://iris-api.circle.com'
 export const INJECTIVE_DOMAIN = 29
 export const SOLANA_DOMAIN = 5
-// CCTP V2 contracts share one address on every EVM chain: https://developers.circle.com/cctp/references/contract-addresses
+// CCTP V2 contracts share one address on almost every EVM chain: https://developers.circle.com/cctp/references/contract-addresses
 export const TOKEN_MESSENGER: Hex = testnet ? '0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA' : '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d'
 export const MESSAGE_TRANSMITTER: Hex = testnet ? '0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275' : '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64'
+// The exceptions, by domain: on EDGE the usual addresses have no code, and Circle lists these instead.
+const OWN_CONTRACTS: Record<number, { tokenMessenger: Hex; messageTransmitter: Hex }> = testnet
+  ? {}
+  : { 28: { tokenMessenger: '0x98706a006bc632df31cadfcbd43f38887ce2ca5c', messageTransmitter: '0x5b61381fc9e58e70efc13a4a97516997019198ee' } }
+// Hard-coded addresses in their checksummed form, whatever case they were written in (a wrong checksum fails viem's checks).
+export const checksum = (address: string) => getAddress(address.toLowerCase())
 
 // Chains viem doesn't have yet. https://chainid.network
 const edge = defineChain({
@@ -90,7 +97,19 @@ export const chains = evmChains.flatMap(([domain, name, mainnet, usdc, testChain
   const chain = testnet ? testChain : mainnet
   if (!chain) return []
   const client = createPublicClient({ chain, transport: transport(rpcEnv(name)) })
-  return [{ domain, name: testnet ? chain.name : name, rpcEnv: rpcEnv(name), chain, client, usdc: (testnet ? testUsdc : usdc)! }]
+  const own = OWN_CONTRACTS[domain]
+  return [
+    {
+      domain,
+      name: testnet ? chain.name : name,
+      rpcEnv: rpcEnv(name),
+      chain,
+      client,
+      usdc: checksum((testnet ? testUsdc : usdc)!),
+      tokenMessenger: checksum(own?.tokenMessenger ?? TOKEN_MESSENGER),
+      messageTransmitter: checksum(own?.messageTransmitter ?? MESSAGE_TRANSMITTER),
+    },
+  ]
 })
 export type EvmChain = (typeof chains)[number]
 export const chainOf = (domain: number) => chains.find((chain) => chain.domain === domain)

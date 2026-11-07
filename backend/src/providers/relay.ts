@@ -1,7 +1,7 @@
 import type { Hex } from 'viem'
 import { HYPERLIQUID_API, sameAddress, type ChainInfo } from '../chains'
 import { base58Encode, publicKey, solanaRpc } from '../solana'
-import { approval, decimal, getJson, idOn, ProviderError, reaches, sum, tokenOn, usdValue, type Progress, type Provider, type Step, type TypedData } from './shared'
+import { approval, decimal, getJson, idOn, isNative, ProviderError, reaches, sum, tokenOn, usdValue, type Progress, type Provider, type Step, type TypedData } from './shared'
 
 // Relay: solvers fill the transfer on the destination from their own funds, then settle with Relay.
 // https://docs.relay.link/references/api/get-quote-v2. Without RELAY_API_KEY quotes are limited (50 a minute per key, less
@@ -22,7 +22,7 @@ type RelayQuote = {
   requestId?: string
   steps: { id: string; kind: string; items?: { data?: EvmTx | SolanaTx | Authorize | HyperliquidTx }[] }[]
   fees?: { gas?: Amount; relayer?: Amount; app?: Amount }
-  details: { currencyIn?: Amount; currencyOut: Amount; timeEstimate: number }
+  details: { currencyIn?: Amount; currencyOut: Amount; currencyGasTopup?: Amount; timeEstimate: number }
 }
 
 // Hyperliquid's perps USDC, which the app counts in 6 decimals like LI.FI and Across; Relay counts it in 8, at this address.
@@ -41,6 +41,11 @@ export const relay: Provider = {
   async quote(req, signal) {
     const [scaleIn, scaleOut] = [perpsScale(req.from, req.fromToken), perpsScale(req.to, req.toToken)]
     const fromHyperliquid = req.from.kind === 'hypercore'
+    // Relay tops up gas only on EVM chains, when the transfer delivers something else. https://docs.relay.link/features/gas-top-up
+    const topup = req.topupGasUsd
+    if (topup && (req.to.kind !== 'evm' || req.from.id === req.to.id || isNative(req.to, req.toToken))) {
+      throw new ProviderError(400, 'Relay adds gas only to transfers into an EVM chain that deliver another token')
+    }
     const body = {
       user: req.sender,
       recipient: req.recipient,
@@ -54,6 +59,8 @@ export const relay: Provider = {
       // Not includeComputeUnitLimit: Relay's limit ran Solana swap routes out of compute in simulation; the default is ample.
       indicativeQuote: req.preview, // the price without building transactions
       ...(fromHyperliquid && { protocolVersion: 'v2', refundTo: req.sender }), // v2: the nonce-mapping flow below
+      // In dollars with 6 decimals ("1000000" is $1; the docs' example is off by ten), taken out of the amount.
+      ...(topup ? { topupGas: true, topupGasAmount: String(Math.round(topup * 1e6)) } : {}),
     }
     const q = await getJson<RelayQuote>(`${API}/quote/v2`, { method: 'POST', body: JSON.stringify(body), headers, signal }).catch((err) => {
       // 400 is every "can't quote this" (no route, amount too low or high, unsupported token); 401, 429 and 5xx are errors.
@@ -91,15 +98,21 @@ export const relay: Provider = {
         } else return
       }
     const { fees, details } = q
+    // The gas Relay delivers besides the token. A route without it would silently leave the recipient without gas.
+    const gas = details.currencyGasTopup
+    if (topup && !(BigInt(gas?.amount ?? 0) > 0n)) throw new ProviderError(400, 'Relay left the gas top-up out of this route')
+    const gasTopup = topup && gas ? { amount: gas.amount, usd: usdValue(gas.amountUsd) } : undefined
     return {
       provider: 'relay',
       amountOut: (BigInt(details.currencyOut.amount) / scaleOut).toString(),
       minAmountOut: (BigInt(details.currencyOut.minimumAmount) / scaleOut).toString(),
       seconds: details.timeEstimate,
-      feeUsd: sum([fees?.relayer?.amountUsd, fees?.app?.amountUsd]), // the relayer's can be negative: a reward for rebalancing it
+      // The relayer's can be negative: a reward for rebalancing it. It includes the gas top-up, which is delivered, not a fee.
+      feeUsd: sum([fees?.relayer?.amountUsd, fees?.app?.amountUsd]) - (gasTopup?.usd ?? 0),
       costUsd: sum([fees?.gas?.amountUsd]),
       usdIn: usdValue(details.currencyIn?.amountUsd),
       usdOut: usdValue(details.currencyOut.amountUsd),
+      gasTopup,
       steps: req.preview ? [] : steps,
       track: { requestId: q.requestId ?? '' },
     }

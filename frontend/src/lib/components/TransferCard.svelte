@@ -7,6 +7,7 @@
   import { Spinner } from '$lib/components/ui/spinner'
   import { INJECTIVE, redeem, SOLANA, type EvmChain, type Transfer } from '$lib/api'
   import { app, chainFor, navigate, txLink } from '$lib/app.svelte'
+  import { messageTransmitterOf } from '$lib/cctp'
   import { encode, formatAmount, short } from '$lib/evm'
   import { solanaAddress } from '$lib/solana'
   import type { Recent } from '$lib/transfers.svelte'
@@ -85,9 +86,9 @@
       await switchChain(chain)
       busy = 'Confirm in your wallet…'
       const data = encode.receiveMessage(message!, attestation!)
-      const hash = await sendTx(chain, { to: app.config!.messageTransmitter, data }, { padGas: chain.domain === INJECTIVE })
+      const hash = await sendTx(chain, { to: messageTransmitterOf(chain), data }, { padGas: chain.domain === INJECTIVE })
       busy = 'Claiming…'
-      if (!(await waitForReceipt(hash))) throw new Error('The claim transaction failed.')
+      if (!(await waitForReceipt(hash, chain))) throw new Error('The claim transaction failed.')
       const redeemTxUrl = txLink(chain, hash)
       onupdate({ ...t!, status: 'redeemed', note: undefined, message: undefined, attestation: undefined, redeemTx: hash, redeemTxUrl })
     } catch (err) {

@@ -1,6 +1,7 @@
 import type { Hex } from 'viem'
-import { chainBySource, sameAccount } from '../chains'
+import { chainBySource, sameAccount, sameAddress } from '../chains'
 import { encodeMessage, type CosmosMessage } from '../cosmos'
+import { checkCosmos } from '../safety'
 import { decimal, getJson, idOn, isNative, ProviderError, reaches, sum, tokenOn, usdValue, type Progress, type Provider, type QuoteRequest, type Step } from './shared'
 
 // Skip Go: Skip's router over IBC, CCTP, Go Fast, Axelar, Eureka and more, the one bridge here that reaches (and sends
@@ -90,6 +91,8 @@ export const skip: Provider = {
   supports: (from, to) => reaches('skip', from, to),
 
   async quote(req, signal) {
+    // A swap on one chain names one address, the sender's, which gets what it buys: never one for someone else.
+    if (req.from.id === req.to.id && !sameAddress(req.recipient, req.sender)) return
     const [from, to] = [skipId(req.from), skipId(req.to)]
     const transfer = {
       source_asset_chain_id: from,
@@ -131,11 +134,15 @@ export const skip: Provider = {
         // Only messages the app knows how to sign, from the sender on the source chain.
         const messages = c.msgs.map((m) => encodeMessage(m.msg_type_url, m.msg))
         if (c.chain_id !== from || c.signer_address !== req.sender || messages.some((m) => !m)) return
+        // Moving only the token sent, at most the amount (see ../safety.ts), else refused like the other checks there.
+        const refused = checkCosmos(req, transfer.source_asset_denom, c.msgs)
+        if (refused) throw new ProviderError(400, refused)
         steps.push({ kind: 'cosmos', chainId: c.chain_id, signer: c.signer_address, messages: messages as CosmosMessage[] })
       } else if (e) {
         const chain = Number(e.chain_id)
+        // For the amount sent, whatever Skip asks for; ../safety.ts checks the token and spender.
         for (const a of e.required_erc20_approvals ?? []) {
-          steps.push({ kind: 'approve', chainId: chain, token: a.token_contract, spender: a.spender, amount: a.amount })
+          steps.push({ kind: 'approve', chainId: chain, token: a.token_contract, spender: a.spender, amount: req.amount.toString() })
         }
         const data = (e.data.startsWith('0x') ? e.data : `0x${e.data}`) as Hex // Skip leaves out the 0x
         steps.push({ kind: 'evm', chainId: chain, to: e.to, data, value: decimal(e.value) })

@@ -2,10 +2,10 @@ import { getConfig, INJECTIVE, type Chain, type Config, type EvmChain } from './
 import { restoreCosmos } from './cosmos-wallet.svelte'
 import { trackRecent } from './transfers.svelte'
 
-type View = 'bridge' | 'swap' | 'track' | 'terms'
+type View = 'bridge' | 'onboard' | 'swap' | 'track' | 'terms'
 
 // Each view has a path. Other apps can deep link to a lookup: /track?q=<address or tx hash> (or the older /?q=…).
-const PATHS: Record<View, string> = { bridge: '/bridge', swap: '/get-inj', track: '/track', terms: '/terms' }
+const PATHS: Record<View, string> = { bridge: '/bridge', onboard: '/onboard', swap: '/get-inj', track: '/track', terms: '/terms' }
 export const linkedQuery = new URLSearchParams(location.search).get('q')?.trim() ?? ''
 const viewAt = (path: string) => (Object.keys(PATHS) as View[]).find((view) => PATHS[view] === path.replace(/\/+$/, ''))
 

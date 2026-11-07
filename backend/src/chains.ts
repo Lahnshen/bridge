@@ -1,7 +1,7 @@
 import { createPublicClient, type Chain as ViemChain, type Hex, type PublicClient } from 'viem'
 import * as viemChains from 'viem/chains'
 import { bech32Decode, bech32Encode } from './bech32'
-import { chains as cctpChains, network, rpcEnv, SLUGS, solana, SOLANA_DOMAIN, transport } from './config'
+import { chains as cctpChains, checksum, network, rpcEnv, SLUGS, solana, SOLANA_DOMAIN, transport } from './config'
 
 // Every chain the bridges reach, merged from their chain lists (refreshed every 6 hours): the CCTP chains, then the others
 // by EVM chain id, Cosmos chain id, or VM. Each has a short id, used in links and by the API: "ethereum", "osmosis", "bitcoin".
@@ -23,7 +23,7 @@ export type Kind =
   | 'stellar'
   | 'starknet'
   | 'iota'
-export type Source = 'lifi' | 'skip' | 'debridge' | 'relay' | 'across' | 'layerzero' | 'usdt0'
+export type Source = 'lifi' | 'skip' | 'debridge' | 'relay' | 'across' | 'layerzero' | 'usdt0' | 'orderbook'
 export type Asset = { address: string; symbol: string; name: string; decimals: number; logo?: string }
 
 export type ChainInfo = {
@@ -88,7 +88,9 @@ const IDS: Record<number, string> = { 56: 'bnb', 324: 'zksync', 1101: 'polygon-z
 // usual time to arrive, set by the confirmations USDT0 waits for on the source chain (medians on LayerZero Scan, Nov 2026;
 // newer deployments without one yet). Every OFT peers with every other. https://docs.usdt0.to/api/deployments?product=usdt0
 // Hedera and Tempo wrap USDT0 differently and are left out, as is the legacy mesh's pools (Tron, TON).
-export const USDT0_MESH: Record<number, { eid: number; oft: Hex; token: Hex; seconds?: number }> = {
+// Addresses are checksummed on load: some were copied with a wrong checksum (Rootstock's token).
+type Mesh = { eid: number; oft: Hex; token: Hex; seconds?: number }
+const mesh: Record<number, Mesh> = {
   1: { eid: 30101, oft: '0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee', token: '0xdAC17F958D2ee523a2206206994597C13D831ec7', seconds: 1080 }, // Ethereum: locks USDT
   10: { eid: 30111, oft: '0xF03b4d9AC1D5d1E7c4cEf54C2A313b9fe051A0aD', token: '0x01bFF41798a0BcF287b996046Ca68b395DbC1071', seconds: 2040 }, // OP
   42161: { eid: 30110, oft: '0x14E4A1B13bf7F943c8ff7C51fb60FA964A298D92', token: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', seconds: 1140 }, // Arbitrum
@@ -109,6 +111,9 @@ export const USDT0_MESH: Record<number, { eid: number; oft: Hex; token: Hex; sec
   30: { eid: 30333, oft: '0x1a594d5d5d1c426281C1064B07f23F57B2716B61', token: '0x779dED0C9e1022225F8e0630b35A9B54Be713736' }, // Rootstock
   988: { eid: 30396, oft: '0xedaba024be4d87974d5aB11C6Dd586963CcCB027', token: '0x779Ded0c9e1022225f8E0630b35a9b54bE713736' }, // Stable
 }
+export const USDT0_MESH: Record<number, Mesh> = Object.fromEntries(
+  Object.entries(mesh).map(([id, m]) => [id, { ...m, oft: checksum(m.oft), token: checksum(m.token) }]),
+)
 
 // ---- The bridges' chain lists ------------------------------------------------------------------------
 
@@ -309,6 +314,11 @@ function build(raw: Raw): ChainInfo[] {
     const chain = evm(id)
     if (chain) chain.ids.usdt0 = id
   }
+  // Injective's own orderbook, for swaps there (see ./providers/orderbook.ts).
+  for (const id of Object.keys(ONE_CHAIN).map(Number)) {
+    const chain = evm(id)
+    if (chain) chain.ids.orderbook = id
+  }
 
   // What the bridges didn't say about EVM chains, from viem's chain list.
   for (const chain of chains.values()) {
@@ -364,7 +374,7 @@ function finish(map: Map<string, ChainInfo>): ChainInfo[] {
 // EVM chains whose Cosmos side is the same chain to the user, listed as one. On Injective the tokens are the same on both
 // sides (each bank denom has an ERC20 twin: the MultiVM Token Standard) and so is the account (inj1… is the 0x… address).
 // Bridges still see two chains: Skip reaches the Cosmos side as injective-1, the others the EVM side.
-const ONE_CHAIN: Record<number, string> = { 1776: 'injective-1' }
+export const ONE_CHAIN: Record<number, string> = { 1776: 'injective-1' }
 
 function joinSides(list: ChainInfo[]) {
   for (const c of list) {

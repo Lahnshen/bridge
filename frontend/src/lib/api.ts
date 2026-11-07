@@ -17,7 +17,8 @@ type ChainBase = {
   send: boolean // the app can send from it; the others are destinations only
 }
 // cosmos: the chain's Cosmos side, when the two are one chain (Injective): its routes over IBC start and end there.
-export type EvmChain = ChainBase & { kind: 'evm'; chainId: number; rpc?: string; usdc?: Hex; cosmos?: CosmosChain }
+// tokenMessenger and messageTransmitter: the chain's own CCTP contracts, listed for each CCTP chain (EDGE's differ).
+export type EvmChain = ChainBase & { kind: 'evm'; chainId: number; rpc?: string; usdc?: Hex; cosmos?: CosmosChain; tokenMessenger?: Hex; messageTransmitter?: Hex }
 // Addresses are base58. tokenMessenger and messageTransmitter are the CCTP V2 programs.
 export type SolanaChain = ChainBase & { kind: 'solana'; usdc: string; rpc?: string; tokenMessenger: string; messageTransmitter: string }
 // slip44 is the key type: chains with the same one share an account (60 is Ethereum's: inj1… is the 0x… address).
@@ -136,7 +137,7 @@ export const redeem = (txHash: string, domain: number) =>
 
 export const NATIVE = '0x0000000000000000000000000000000000000000' // an EVM chain's gas token
 export const SOL = '11111111111111111111111111111111'
-const sameAddress = (a: string, b: string) => (a.startsWith('0x') && b.startsWith('0x') ? a.toLowerCase() === b.toLowerCase() : a === b)
+export const sameAddress = (a: string, b: string) => (a.startsWith('0x') && b.startsWith('0x') ? a.toLowerCase() === b.toLowerCase() : a === b)
 // The chain's gas token: NATIVE on EVM chains, SOL on Solana, the fee denom on Cosmos chains.
 export const isNative = (chain: Chain, address: string) => !!chain.native && sameAddress(address, chain.native.address)
 
@@ -182,6 +183,7 @@ export type Quote = {
   needs?: string[] // chains the route passes through where it needs one of the user's addresses (chain ids)
   side?: string // the id of Injective's Cosmos side, when the route starts or ends there instead of the EVM side
   track: Record<string, string>
+  gasTopup?: { amount: string; usd?: number } // the destination's gas token Relay adds, when asked to (topupGasUsd)
 }
 export type QuoteBody = {
   from: string
@@ -194,6 +196,7 @@ export type QuoteBody = {
   addresses?: Record<string, string> // the user's accounts on other chains, by chain id
   slippageBps?: number
   providers?: string[]
+  topupGasUsd?: number // Relay only: this many dollars of the destination's gas token on top
 }
 export type Progress = { status: 'pending' | 'done' | 'failed' | 'refunded'; destinationTx?: string; amountOut?: string; note?: string }
 
@@ -207,16 +210,17 @@ export function tokenBalance(chain: Chain, owner: string, token: string, signal?
   const server = call<{ raw: string }>(`/balance/${chain.id}/${owner}?token=${encodeURIComponent(token)}`, { signal }).then((r) => BigInt(r.raw))
   if (chain.kind !== 'evm' || !chain.rpc || !token.startsWith('0x')) return server // Injective's denoms: the server reads them
   const direct = token === NATIVE
-    ? rpc(chain.rpc, 'eth_getBalance', [owner, 'latest'], signal)
-    : rpc(chain.rpc, 'eth_call', [{ to: token, data: encode.balanceOf(owner as Hex) }, 'latest'], signal)
+    ? rpc<string>(chain.rpc, 'eth_getBalance', [owner, 'latest'], signal)
+    : rpc<string>(chain.rpc, 'eth_call', [{ to: token, data: encode.balanceOf(owner as Hex) }, 'latest'], signal)
   return Promise.any([server, direct.then(BigInt)])
 }
 
-async function rpc(url: string, method: string, params: unknown[], signal?: AbortSignal): Promise<string> {
+// A JSON-RPC call to a chain's node, which may not answer: its result (null where the node knows nothing of what was asked).
+export async function rpc<T>(url: string, method: string, params: unknown[], signal?: AbortSignal): Promise<T> {
   const timeout = AbortSignal.timeout(10_000)
   const res = await fetch(url, { ...post({ jsonrpc: '2.0', id: 1, method, params }), signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
   const data = await res.json()
-  if (typeof data.result !== 'string') throw new Error(data.error?.message ?? `RPC error (${res.status})`)
+  if (data.error || !('result' in data)) throw new Error(data.error?.message ?? `RPC error (${res.status})`)
   return data.result
 }
 
@@ -228,7 +232,102 @@ export const getRouteStatus = (body: { provider: string; txHash: string; from: s
 // ---- Sending from Cosmos chains: the server builds the transaction, the wallet signs it, the server broadcasts it -----
 
 export type PreparedTx = { chainId: string; accountNumber: string; bodyBytes: string; authInfoBytes: string; fee: { denom: string; amount: string; gas: string } }
-export const prepareCosmosTx = (body: { chain: string; signer: string; pubKey: string; algo?: string; messages: { typeUrl: string; value: string }[]; memo?: string }) =>
-  call<PreparedTx>('/cosmos/prepare', post(body), 45_000)
-export const broadcastCosmosTx = (body: { chain: string; bodyBytes: string; authInfoBytes: string; signature: string }) => call<{ txHash: string }>('/cosmos/broadcast', post(body))
+// For an EVM wallet on Injective (evm: the chain id it signs at): the typed data to sign instead of authInfoBytes.
+export type Eip712Tx = Omit<PreparedTx, 'authInfoBytes'> & { sequence: string; typedData: TypedData & { message: { context: string; msgs: string } } }
+type CosmosMessages = { chain: string; signer: string; messages: { typeUrl: string; value: string }[]; memo?: string }
+export const prepareCosmosTx = (body: CosmosMessages & { pubKey: string; algo?: string }) => call<PreparedTx>('/cosmos/prepare', post(body), 45_000)
+export const prepareEip712Tx = (body: CosmosMessages & { evm: number }) => call<Eip712Tx>('/cosmos/prepare', post(body), 45_000)
+export const broadcastCosmosTx = (body: { chain: string; bodyBytes: string; signature: string } & ({ authInfoBytes: string } | { typedData: Eip712Tx['typedData']; signer: string })) =>
+  call<{ txHash: string }>('/cosmos/broadcast', post(body))
 export const cosmosTxStatus = (chain: string, hash: string) => call<{ status: 'pending' | 'success' | 'failed'; height?: string; error?: string }>(`/cosmos/tx/${chain}/${hash}`)
+
+// ---- Onboard: what a wallet holds on every network, moved into one stable on one chain -----------------
+
+// A chain to onboard to: its canonical stables (USDC first), and how its gas works. stable: the stable pays the gas there
+// (Arc, Noble…). receiveOnly: the app can't sign there (Tron, Sui), so it needs a pasted recipient and plans no gas.
+export type Destination = { chain: string; tokens: Token[]; gas: { stable: boolean; starterUsd: number; hasGasUsd: number }; receiveOnly: boolean }
+// scan: the chains holdings are read on. minRedeemUsdc: below it, CCTP burns to Injective aren't minted by the server.
+// getInj: the gas-free USDC → INJ swap, when the server offers it, and its minimum (USDC).
+export type OnboardConfig = {
+  destinations: Destination[]
+  scan: { evm: string[]; cosmos: string[]; solana: boolean; hyperliquid: boolean }
+  minRedeemUsdc: string
+  getInj: { enabled: boolean; min: string }
+}
+
+// raw: base units held. usd: what it's worth, when priced; source: where that price came from. native: the chain's gas
+// token. stable: one of the canonical stables. illiquid: it looks unsellable (worth too much of its market cap or trading).
+// unsupported: no bridge lists it, so it's shown for its value but can't be moved.
+export type Holding = {
+  token: Token
+  raw: string
+  usd?: number
+  price?: number
+  source?: 'stable' | 'list' | 'market' | 'symbol'
+  native?: boolean
+  stable?: 'usdc' | 'usdt'
+  illiquid?: boolean
+  unsupported?: boolean
+}
+export type Accounts = { evm?: string; solana?: string; cosmos?: Record<string, string> } // cosmos: by chain id
+export type ChainHoldings = { chain: string; holdings: Holding[]; error?: string }
+
+// One transaction (or signature) of a plan, in base units. base: the part of amount the selection holds up front; the rest
+// comes from the legs in inputs. after: legs to finish first. cctp: the burn's options and fees as /fees gave them.
+export type Leg = {
+  id: string
+  kind: 'swap' | 'bridge' | 'cctp' | 'get-inj'
+  purpose: 'consolidate' | 'gas' | 'refuel'
+  from: string
+  to: string
+  fromToken: Token
+  toToken: Token
+  amount: string
+  base: string
+  inputs?: string[]
+  after?: string[]
+  provider: string
+  name: string
+  via?: string
+  side?: string
+  wallet: 'evm' | 'solana' | 'cosmos'
+  amountOut: string
+  minAmountOut: string
+  seconds: number
+  feeUsd?: number
+  costUsd?: number
+  usdIn?: number
+  usdOut?: number
+  topupGasUsd?: number
+  feeNative?: string // what it pays in its chain's gas token on top of the amount (deBridge's fixed fee)
+  cctp?: { fast: boolean; forward: boolean; fastBps: number | null; forwardFee: string | null; recipientSetup: boolean }
+  needs?: string[]
+  group?: number // the group of accounts that sends it, by its place in the plan's body (absent: the first)
+}
+export type Dropped = 'too-small' | 'no-route' | 'high-loss' | 'illiquid' | 'needs-gas' | 'needs-wallet' | 'unsupported'
+export type Plan = {
+  legs: Leg[]
+  kept: { chain: string; token: Token; amount: string; usd?: number; group?: number }[]
+  dropped: { chain: string; token: Token; amount: string; usd?: number; reason: Dropped; detail: string; group?: number }[]
+  summary: { usdIn: number; amountOut: string; minAmountOut: string; feesUsd: number; costUsd: number; seconds: number }
+  gas: { kind: 'none' | 'has-gas' | 'stable' | 'get-inj' | 'topup' | 'leg' | 'unavailable'; usd?: number; detail: string }
+}
+// What one group of accounts moves: natives are its gas token balances, by chain id (the destination's too); unknown ones
+// left out.
+export type PlanPart = { sender: Accounts; items: { chain: string; token: string; amount: string; usd?: number }[]; natives: Record<string, string> }
+// others: the user's other accounts in the same wallets, a group each, planned on their own; the first group gets the
+// destination's gas.
+export type PlanBody = PlanPart & {
+  to: string
+  toToken: string
+  recipient?: string
+  others?: PlanPart[]
+  gas?: boolean
+  slippageBps?: number
+}
+
+export const getOnboard = () => call<OnboardConfig>('/onboard')
+// Several calls in parallel, a few chains each, so the list fills in as they answer. fresh: not from the server's cache of
+// the last minute (after a run, or on Rescan).
+export const getHoldings = (body: Accounts & { chains?: string[]; fresh?: boolean }, signal?: AbortSignal) => call<{ chains: ChainHoldings[] }>('/holdings', { ...post(body), signal }, 75_000)
+export const planOnboard = (body: PlanBody, signal?: AbortSignal) => call<Plan>('/onboard/plan', { ...post(body), signal }, 60_000)

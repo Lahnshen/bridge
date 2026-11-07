@@ -1,15 +1,17 @@
 import { Elysia, t } from 'elysia'
 import { formatEther } from 'viem'
 import { autoRedeem, balance, fees, history, HttpError, lookupAddress, lookupTx, redeem } from './cctp'
-import { chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, port, redeemsPerMinute, relayer, requestsPerMinute, solana, TOKEN_MESSENGER, trustProxy } from './config'
+import { chainOf, chains, corsOrigins, host, injective, MESSAGE_TRANSMITTER, network, onboardPerMinute, port, redeemsPerMinute, relayer, requestsPerMinute, solana, TOKEN_MESSENGER, trustProxy } from './config'
 import { allChains, canSend, chainById, ready, resolveChain, type ChainInfo } from './chains'
-import { broadcast, prepare, txStatus } from './cosmos'
+import { broadcast, prepare, txStatus, type BroadcastBody } from './cosmos'
 import { historyFrom, indexedBlocks, queuedTxs, startIndexer } from './indexer'
 import { SolanaRpcError, solanaRpc } from './solana'
 import { resumeSwaps, swap, swapQuote, swapsEnabled } from './swap'
 import { providerList, providersOn, quoteRequest, quotes, status as routeStatus } from './providers'
 import { ProviderError, type ProviderId } from './providers/shared'
 import { tokenBalance, tokens, warmTokens } from './tokens'
+import { holdings } from './holdings'
+import { onboardConfig, plan } from './onboard'
 
 // Fixed-window counter per client IP.
 function rateLimit(max: number, windowMs = 60_000) {
@@ -26,7 +28,9 @@ function rateLimit(max: number, windowMs = 60_000) {
     return { ok: hit.count <= max, limit: max, remaining: Math.max(0, max - hit.count), reset: Math.ceil((hit.resetAt - now) / 1000) }
   }
 }
-const limits = { requests: rateLimit(requestsPerMinute), redeems: rateLimit(redeemsPerMinute) }
+// Redeems and swaps send transactions; holdings and plans each ask dozens of RPCs and bridges, so they get their own too.
+const limits = { requests: rateLimit(requestsPerMinute), redeems: rateLimit(redeemsPerMinute), onboard: rateLimit(onboardPerMinute) }
+const LIMITED: Record<string, keyof typeof limits> = { '/redeem': 'redeems', '/swap': 'redeems', '/holdings': 'onboard', '/onboard/plan': 'onboard' }
 
 // What a bridge UI needs. rpc is each chain's public RPC, for wallets that have to add the chain; the RPC_* overrides stay private.
 const chainInfo = {
@@ -34,13 +38,16 @@ const chainInfo = {
   autoRedeem: !!relayer,
   swap: swapsEnabled, // USDC → INJ on Injective, see /swap
   providers: providerList(), // bridges quoted besides CCTP, see /quotes
+  // Most chains' CCTP contracts; each chain lists its own (EDGE's differ).
   tokenMessenger: TOKEN_MESSENGER,
   messageTransmitter: MESSAGE_TRANSMITTER,
-  chains: chains.map(({ domain, name, chain, usdc }) => ({
+  chains: chains.map(({ domain, name, chain, usdc, tokenMessenger, messageTransmitter }) => ({
     domain,
     name,
     chainId: chain.id,
     usdc,
+    tokenMessenger,
+    messageTransmitter,
     rpc: chain.rpcUrls.default.http[0],
     explorer: chain.blockExplorers?.default.url,
     nativeCurrency: chain.nativeCurrency,
@@ -57,6 +64,19 @@ const chainInfo = {
 }
 const domainId = t.Integer({ minimum: 0 })
 const chainRef = t.Union([t.String({ maxLength: 64 }), domainId]) // a chain id, or a CCTP domain
+// What one group of the user's accounts moves to the destination (see ./onboard.ts).
+const planPart = {
+  sender: t.Object({
+    evm: t.Optional(t.String({ maxLength: 42 })),
+    solana: t.Optional(t.String({ maxLength: 44 })),
+    cosmos: t.Optional(t.Record(t.String({ maxLength: 64 }), t.String({ maxLength: 120 }), { maxProperties: 20 })),
+  }),
+  items: t.Array(
+    t.Object({ chain: t.String({ maxLength: 64 }), token: t.String({ maxLength: 200 }), amount: t.String({ maxLength: 80 }), usd: t.Optional(t.Number({ minimum: 0 })) }),
+    { maxItems: 300 },
+  ),
+  natives: t.Record(t.String({ maxLength: 64 }), t.String({ maxLength: 80 }), { maxProperties: 120 }),
+}
 
 // Every chain the bridges reach, for the chain picker. send: the app can send from it (EVM, Solana, and Cosmos chains
 // with a REST endpoint); via: the bridges that reach it. rpc and rest are public, for wallets that have to add the chain.
@@ -76,6 +96,7 @@ function networkList() {
   return list
 }
 function networkEntry(c: ChainInfo) {
+  const cctp = c.domain === undefined ? undefined : c.kind === 'solana' ? solana : chainOf(c.domain)
   return {
     id: c.id,
     name: c.name,
@@ -92,6 +113,8 @@ function networkEntry(c: ChainInfo) {
     native: c.native,
     gas: c.gas,
     usdc: c.usdc,
+    tokenMessenger: cctp?.tokenMessenger,
+    messageTransmitter: cctp?.messageTransmitter,
     via: providersOn(c),
     send:
       canSend(c) &&
@@ -126,8 +149,7 @@ const app = new Elysia()
 
     // Behind a proxy, the last X-Forwarded-For entry is the one the proxy added (earlier ones can be forged by the client).
     const ip = (trustProxy && request.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim()) || server?.requestIP(request)?.address || 'unknown'
-    const isRedeem = request.method === 'POST' && ['/redeem', '/swap'].includes(new URL(request.url).pathname) // these send transactions
-    const hit = (isRedeem ? limits.redeems : limits.requests)(ip)
+    const hit = limits[(request.method === 'POST' && LIMITED[new URL(request.url).pathname]) || 'requests'](ip)
     set.headers['ratelimit-limit'] = String(hit.limit)
     set.headers['ratelimit-remaining'] = String(hit.remaining)
     set.headers['ratelimit-reset'] = String(hit.reset)
@@ -178,6 +200,17 @@ const app = new Elysia()
     params: t.Object({ chain: t.String({ maxLength: 64 }) }),
     query: t.Object({ q: t.Optional(t.String({ maxLength: 200 })) }),
   })
+  // A wallet's holdings with USD values, per chain (see ./holdings.ts): every scanned chain, or those in chains. fresh: read
+  // again, not the answer kept from the last 45 seconds.
+  .post('/holdings', async ({ body }) => holdings(body), {
+    body: t.Object({
+      evm: t.Optional(t.String({ maxLength: 42 })),
+      solana: t.Optional(t.String({ maxLength: 44 })),
+      cosmos: t.Optional(t.Record(t.String({ maxLength: 64 }), t.String({ maxLength: 120 }), { maxProperties: 20 })),
+      chains: t.Optional(t.Array(t.String({ maxLength: 64 }), { maxItems: 40 })),
+      fresh: t.Optional(t.Boolean()),
+    }),
+  })
   // Routes from the other bridges, best first. CCTP itself is quoted by /fees.
   .post('/quotes', ({ body }) => quotes(quoteRequest(body), body.providers as ProviderId[] | undefined), {
     body: t.Object({
@@ -191,28 +224,57 @@ const app = new Elysia()
       addresses: t.Optional(t.Record(t.String({ maxLength: 64 }), t.String({ maxLength: 120 }))),
       slippageBps: t.Optional(t.Integer()),
       providers: t.Optional(t.Array(t.String(), { maxItems: 10 })),
+      topupGasUsd: t.Optional(t.Number({ minimum: 0.1, maximum: 5 })),
     }),
   })
   .post('/quotes/status', ({ body }) => routeStatus(body.provider, body), {
     body: t.Object({ provider: t.String(), txHash: t.String({ maxLength: 120 }), from: chainRef, to: chainRef, track: t.Record(t.String(), t.String()) }),
+  })
+  // Onboarding (see ./onboard.ts): where holdings can be consolidated to, and the legs that move a selection there.
+  .get('/onboard', async () => onboardConfig())
+  .post('/onboard/plan', async ({ body }) => plan(body), {
+    body: t.Object({
+      to: t.String({ maxLength: 64 }),
+      toToken: t.String({ maxLength: 200 }),
+      recipient: t.Optional(t.String({ maxLength: 120 })),
+      ...planPart,
+      // The user's other accounts in the same wallets, a group each.
+      others: t.Optional(t.Array(t.Object(planPart), { maxItems: 9 })),
+      gas: t.Optional(t.Boolean()),
+      slippageBps: t.Optional(t.Integer({ minimum: 1, maximum: 500 })),
+    }),
   })
   // Sending from a Cosmos chain: the transaction to sign (see ./cosmos.ts), then the signed one to broadcast.
   .post('/cosmos/prepare', async ({ body }) => prepare({ ...body, chain: knownChain(body.chain) }), {
     body: t.Object({
       chain: t.String({ maxLength: 64 }),
       signer: t.String({ maxLength: 120 }),
-      pubKey: t.String({ maxLength: 100 }),
+      pubKey: t.Optional(t.String({ maxLength: 100 })),
       algo: t.Optional(t.String({ maxLength: 20 })),
       messages: t.Array(t.Object({ typeUrl: t.String({ maxLength: 200 }), value: t.String({ maxLength: 100_000 }) }), { minItems: 1, maxItems: 10 }),
       memo: t.Optional(t.String({ maxLength: 512 })),
+      evm: t.Optional(t.Integer({ minimum: 1 })), // an EVM wallet signs, as EIP-712 typed data, at this chain id (Injective only)
     }),
   })
-  .post('/cosmos/broadcast', async ({ body }) => broadcast({ ...body, chain: knownChain(body.chain) }), {
+  .post('/cosmos/broadcast', async ({ body }) => {
+    if (!body.typedData && !body.authInfoBytes) throw new HttpError(400, 'authInfoBytes or typedData is required.')
+    return broadcast({ ...body, typedData: body.typedData as BroadcastBody['typedData'], chain: knownChain(body.chain) })
+  }, {
     body: t.Object({
       chain: t.String({ maxLength: 64 }),
       bodyBytes: t.String({ maxLength: 200_000 }),
-      authInfoBytes: t.String({ maxLength: 10_000 }),
+      authInfoBytes: t.Optional(t.String({ maxLength: 10_000 })),
       signature: t.String({ maxLength: 200 }),
+      // An EVM wallet's: the typed data it signed (from /cosmos/prepare with evm), its signature in hex, and the sender.
+      typedData: t.Optional(
+        t.Object({
+          types: t.Any(),
+          primaryType: t.String({ maxLength: 20 }),
+          domain: t.Record(t.String({ maxLength: 40 }), t.Any(), { maxProperties: 8 }),
+          message: t.Object({ context: t.String({ maxLength: 4_000 }), msgs: t.String({ maxLength: 300_000 }) }),
+        }),
+      ),
+      signer: t.Optional(t.String({ maxLength: 120 })),
     }),
   })
   .get('/cosmos/tx/:chain/:hash', async ({ params }) => txStatus(knownChain(params.chain), params.hash), {

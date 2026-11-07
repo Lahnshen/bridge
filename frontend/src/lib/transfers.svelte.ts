@@ -41,14 +41,24 @@ const read = (): Recent[] => {
   }
 }
 export const recent = $state<Recent[]>(read())
-const save = () => localStorage.setItem(KEY, JSON.stringify($state.snapshot(recent)))
+// Another tab may have added transfers since this one read them: those are kept too (the newest of them all).
+function save() {
+  const known = new Set(recent.map((r) => r.txHash))
+  const theirs = read().filter((r) => !known.has(r.txHash))
+  if (theirs.length) {
+    recent.push(...theirs)
+    recent.sort((a, b) => b.createdAt - a.createdAt)
+    recent.splice(MAX)
+  }
+  localStorage.setItem(KEY, JSON.stringify($state.snapshot(recent)))
+}
 
 // Returns the stored (reactive) copy, which is the one to update.
 export function addRecent(item: Recent) {
   recent.unshift(item)
   recent.splice(MAX)
   save()
-  return recent[0]!
+  return recent.find((r) => r.txHash === item.txHash) ?? item
 }
 
 export function failRecent(item: Recent, note: string) {
